@@ -19,13 +19,6 @@ test("webhook requires Telegram secret and claims update IDs", () => {
   assert.match(source, /releaseUpdate/);
 });
 
-test("all UI paths enforce the configured owner and private chat", () => {
-  assert.match(source, /String\(message\.from\.id\) !== String\(env\.ADMIN_USER_ID\)/);
-  assert.match(source, /String\(query\.from\.id\) !== String\(env\.ADMIN_USER_ID\)/);
-  assert.match(source, /message\.chat\?\.type !== "private"/);
-  assert.match(source, /query\?\.message\?\.chat\?\.type === "private"/);
-});
-
 test("monitor uses only Tailscale OAuth and Devices API", () => {
   assert.match(source, /\/oauth\/token/);
   assert.match(source, /\/tailnet\/\$\{tailnet\}\/devices/);

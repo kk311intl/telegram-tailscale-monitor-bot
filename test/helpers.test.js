@@ -24,6 +24,14 @@ test("Tailscale IPv4 addresses sort numerically and before IPv6", () => {
   ]);
 });
 
+test("Tailscale IPv6 addresses sort numerically, including compressed forms", () => {
+  const addresses = ["fd7a:115c:a1e0::10", "fd7a:115c:a1e0::2", "2001:db8::1", "fd7a:115c:a1e0::1"];
+  assert.deepEqual(addresses.sort(compareTailscaleAddresses), [
+    "2001:db8::1", "fd7a:115c:a1e0::1", "fd7a:115c:a1e0::2", "fd7a:115c:a1e0::10"
+  ]);
+  assert.equal(compareTailscaleAddresses("fd7a:115c:a1e0::2", "fd7a:115c:a1e0:0:0:0:0:2"), 0);
+});
+
 test("integer settings reject partial and fractional values", () => {
   assert.equal(clampInteger("7", 1, 10, 3), 7);
   assert.equal(clampInteger(undefined, 1, 10, 5), 5);

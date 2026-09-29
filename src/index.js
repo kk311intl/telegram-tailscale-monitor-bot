@@ -87,6 +87,7 @@ async function processMessage(message, env) {
     await telegram(env, "sendMessage", { chat_id: message.chat.id, text: t(env.BOT_LANGUAGE, "privateOnly") });
     return;
   }
+  if (String(message.chat.id) !== String(env.ADMIN_USER_ID)) return;
   const text = String(message.text || "").trim();
   const command = parseCommand(text);
   if (command === "start") return telegram(env, "sendMessage", {
@@ -121,7 +122,8 @@ async function processCallback(query, env) {
   const chatId = query.message.chat.id;
   const messageId = query.message.message_id;
   const [action, rawId = "", rawPage = ""] = String(query.data || "").split(":");
-  if (action === "home") return editOrSend(chatId, messageId, await refreshDashboard(env), env);
+  if (action === "home") return editOrSend(chatId, messageId, await refreshDashboard(env, Number(rawId || 0)), env);
+  if (action === "page") return editOrSend(chatId, messageId, await dashboardView(env, "", Number(rawId || 0)), env);
   if (action === "list") return editDeviceList(chatId, messageId, env, Number(rawId || 0));
   if (action === "detail") return editDeviceDetail(chatId, messageId, env, Number(rawId), Number(rawPage || 0));
   if (action === "check") {
@@ -407,19 +409,23 @@ async function syncWarning(env) {
   }
 }
 
-async function refreshDashboard(env) {
+async function refreshDashboard(env, page = 0) {
   const warning = await syncWarning(env);
   await drainNotificationOutbox(env, 5);
-  return dashboardView(env, warning);
+  return dashboardView(env, warning, page);
 }
 
-async function dashboardView(env, warning = "") {
+async function dashboardView(env, warning = "", requestedPage = 0) {
   if (!(await visibilityFresh(env))) return unavailableView(env);
   const query = await env.STATUS_DB.prepare(`
     SELECT * FROM servers WHERE ports = 'tailscale' AND enabled = 1
   `).all();
   const devices = (query.results || []).sort(compareDeviceRows);
-  const lines = devices.length ? devices.map((row) => formatDashboardDevice(row, env)) : [t(env.BOT_LANGUAGE, "noDevices")];
+  const pages = Math.max(1, Math.ceil(devices.length / LIST_PAGE_SIZE));
+  const page = clampInteger(requestedPage, 0, pages - 1, 0);
+  const lines = devices.length
+    ? devices.slice(page * LIST_PAGE_SIZE, (page + 1) * LIST_PAGE_SIZE).map((row) => formatDashboardDevice(row, env))
+    : [t(env.BOT_LANGUAGE, "noDevices")];
   return {
     text: [
       `<b>${escapeHtml(truncate(env.BOT_TITLE || t(env.BOT_LANGUAGE, "dashboardTitle"), 80))}</b>`,
@@ -430,11 +436,11 @@ async function dashboardView(env, warning = "") {
       `📋 ${t(env.BOT_LANGUAGE, "total")}${t(env.BOT_LANGUAGE, "colon")}${devices.length}`,
       warning ? `\n⚠️ ${t(env.BOT_LANGUAGE, "syncFailed")}` : "",
       "",
-      `<b>${t(env.BOT_LANGUAGE, "allDevices")}</b>`,
+      `<b>${t(env.BOT_LANGUAGE, "allDevices")}</b>${pages > 1 ? ` · ${page + 1}/${pages}` : ""}`,
       ...lines
     ].filter(Boolean).join("\n"),
     parse_mode: "HTML",
-    reply_markup: mainKeyboard(env)
+    reply_markup: mainKeyboard(env, page, pages)
   };
 }
 
@@ -456,10 +462,19 @@ function compareDeviceRows(left, right) {
   return byAddress || String(left.name).localeCompare(String(right.name), "zh-Hant");
 }
 
-function mainKeyboard(env) {
-  return { inline_keyboard: [
-    [{ text: `📋 ${t(env.BOT_LANGUAGE, "deviceList")}`, callback_data: "list:0" }, { text: `🔄 ${t(env.BOT_LANGUAGE, "refresh")}`, callback_data: "home" }]
-  ] };
+function mainKeyboard(env, page = 0, pages = 1) {
+  const buttons = [[
+    { text: `📋 ${t(env.BOT_LANGUAGE, "deviceList")}`, callback_data: "list:0" },
+    { text: `🔄 ${t(env.BOT_LANGUAGE, "refresh")}`, callback_data: `home:${page}` }
+  ]];
+  if (pages > 1) {
+    const navigation = [];
+    if (page > 0) navigation.push({ text: t(env.BOT_LANGUAGE, "previous"), callback_data: `page:${page - 1}` });
+    navigation.push({ text: `${page + 1}/${pages}`, callback_data: `page:${page}` });
+    if (page + 1 < pages) navigation.push({ text: t(env.BOT_LANGUAGE, "next"), callback_data: `page:${page + 1}` });
+    buttons.push(navigation);
+  }
+  return { inline_keyboard: buttons };
 }
 
 async function sendDeviceList(chatId, env, page) {

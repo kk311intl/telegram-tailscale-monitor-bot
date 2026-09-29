@@ -133,7 +133,24 @@ export function compareTailscaleAddresses(left, right) {
   if (a !== null && b !== null) return a - b;
   if (a !== null) return -1;
   if (b !== null) return 1;
+  const a6 = ipv6Number(left);
+  const b6 = ipv6Number(right);
+  if (a6 !== null && b6 !== null) return a6 < b6 ? -1 : a6 > b6 ? 1 : 0;
+  if (a6 !== null) return -1;
+  if (b6 !== null) return 1;
   return String(left || "").localeCompare(String(right || ""), "en");
+}
+
+function ipv6Number(value) {
+  try {
+    const normalized = new URL(`http://[${value}]/`).hostname.slice(1, -1);
+    const [left, right] = normalized.split("::");
+    const head = left ? left.split(":") : [];
+    const tail = right ? right.split(":") : [];
+    const parts = [...head, ...Array(8 - head.length - tail.length).fill("0"), ...tail];
+    if (parts.length !== 8) return null;
+    return parts.reduce((total, part) => (total << 16n) + BigInt(`0x${part}`), 0n);
+  } catch { return null; }
 }
 
 function ipv4Number(value) {

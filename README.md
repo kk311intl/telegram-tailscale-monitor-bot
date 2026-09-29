@@ -2,7 +2,7 @@
 
 [中文](#zh-tw) · [日本語](#ja) · [English](#en)
 
-版本 / バージョン / Version：`v1.2.0`
+版本 / バージョン / Version：`v1.3.0`
 
 
 <a id="zh-tw"></a>
@@ -57,7 +57,7 @@ pwsh -File ./tools/Register-TelegramWebhook.ps1 -WorkerUrl https://YOUR_WORKER.w
 
 ### 使用與驗證
 
-Telegram 私聊 `/start` 顯示最近的有效快照；`/status` 同步並顯示總覽，`/list` 顯示設備，`/device ID` 顯示詳情。只有 `ADMIN_USER_ID` 可操作。Worker 每分鐘同步；連續兩次有效離線觀察、且至少相隔 60 秒，才確認離線。短暫 API 故障不會把設備判成離線；只有符合 `HIDDEN_TAGS` 的設備會隱藏。
+Telegram 私聊 `/start` 顯示最近的有效快照；`/status` 同步並顯示總覽，`/list` 顯示設備，`/device ID` 顯示詳情。總覽和設備列表每頁顯示 10 台，可用按鈕翻頁。只有 `ADMIN_USER_ID` 可操作。Worker 每分鐘同步；連續兩次有效離線觀察、且至少相隔 60 秒，才確認離線。短暫 API 故障不會把設備判成離線；符合 `HIDDEN_TAGS` 的設備會隱藏。
 
 ```powershell
 Invoke-RestMethod https://YOUR_WORKER.workers.dev/health
@@ -117,7 +117,7 @@ pwsh -File ./tools/Register-TelegramWebhook.ps1 -WorkerUrl https://YOUR_WORKER.w
 
 ### 使い方と確認
 
-Telegram の個人チャットで `/start` は有効な最新スナップショット、`/status` は同期と概要、`/list` は端末一覧、`/device ID` は詳細を表示します。操作できるのは `ADMIN_USER_ID` のみです。Worker は毎分同期し、60 秒以上離れた有効なオフライン観測が 2 回続くとオフラインと判定します。一時的な API 障害ではオフラインにせず、`HIDDEN_TAGS` に指定した端末だけを非表示にします。
+Telegram の個人チャットで `/start` は有効な最新スナップショット、`/status` は同期と概要、`/list` は端末一覧、`/device ID` は詳細を表示します。概要と端末一覧は 1 ページ 10 台で、ボタンからページを切り替えられます。操作できるのは `ADMIN_USER_ID` のみです。Worker は毎分同期し、60 秒以上離れた有効なオフライン観測が 2 回続くとオフラインと判定します。一時的な API 障害ではオフラインにせず、`HIDDEN_TAGS` に指定した端末を非表示にします。
 
 ```powershell
 Invoke-RestMethod https://YOUR_WORKER.workers.dev/health
@@ -177,7 +177,7 @@ The last step securely prompts for the Bot Token and the same webhook secret, th
 
 ### Usage and verification
 
-In a private Telegram chat, `/start` shows the latest valid snapshot, `/status` syncs and shows the overview, `/list` shows devices, and `/device ID` shows details. Only `ADMIN_USER_ID` can operate the bot. The Worker syncs each minute; it confirms offline status after two valid offline observations at least 60 seconds apart. Temporary API failures do not mark devices offline, and only devices matching `HIDDEN_TAGS` are hidden.
+In a private Telegram chat, `/start` shows the latest valid snapshot, `/status` syncs and shows the overview, `/list` shows devices, and `/device ID` shows details. The overview and device list show ten devices per page, with buttons to change pages. Only `ADMIN_USER_ID` can operate the bot. The Worker syncs each minute; it confirms offline status after two valid offline observations at least 60 seconds apart. Temporary API failures do not mark devices offline, and devices matching `HIDDEN_TAGS` are hidden.
 
 ```powershell
 Invoke-RestMethod https://YOUR_WORKER.workers.dev/health

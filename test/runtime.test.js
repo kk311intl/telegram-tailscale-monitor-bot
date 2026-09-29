@@ -73,6 +73,68 @@ test('message and button refresh render the same dashboard', async t => {
     sent.find(call => call.method === 'editMessageText').body.text);
 });
 
+test('dashboard shows ten devices per page and keeps refresh on the selected page', async t => {
+  const { env, devices, calls } = setup(t);
+  devices.splice(0, devices.length, ...Array.from({ length: 120 }, (_, index) => ({
+    id: `n${index + 1}`, name: `node${String(index + 1).padStart(3, '0')}-${'x'.repeat(24)}.example.ts.net`,
+    connectedToControl: true, tags: []
+  })));
+  await app.syncTailscaleDevices(env, false);
+  const first = await app.dashboardView(env);
+  const second = await app.dashboardView(env, '', 1);
+  assert.match(first.text, /node001/);
+  assert.doesNotMatch(first.text, /node011/);
+  assert.match(second.text, /node011/);
+  assert.doesNotMatch(second.text, /node001/);
+  assert.match(first.text, /node010/);
+  assert.doesNotMatch(second.text, /node021/);
+  assert.equal(first.reply_markup.inline_keyboard[1].at(-1).callback_data, 'page:1');
+  assert.equal(second.reply_markup.inline_keyboard[0][1].callback_data, 'home:1');
+  for (let page = 0; page < 12; page++) assert.ok((await app.dashboardView(env, '', page)).text.length < 4096);
+
+  const sent = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url, init) => {
+    if (String(url).includes('api.telegram.org')) sent.push({ method: String(url).split('/').at(-1), body: JSON.parse(init.body) });
+    return originalFetch(url, init);
+  };
+  const apiCallsBeforePaging = calls.filter(url => url.includes('/devices?')).length;
+  await app.processUpdate({ callback_query: {
+    id: 'next-page', from: { id: 1 }, data: 'page:1',
+    message: { chat: { id: 1, type: 'private' }, message_id: 10 }
+  } }, env);
+  assert.equal(sent.find(call => call.method === 'editMessageText').body.text, second.text);
+  assert.equal(calls.filter(url => url.includes('/devices?')).length, apiCallsBeforePaging);
+  await app.processUpdate({ callback_query: {
+    id: 'refresh-page', from: { id: 1 }, data: 'home:1',
+    message: { chat: { id: 1, type: 'private' }, message_id: 10 }
+  } }, env);
+  assert.equal(sent.filter(call => call.method === 'editMessageText').at(-1).body.text, second.text);
+  assert.equal(calls.filter(url => url.includes('/devices?')).length, apiCallsBeforePaging + 1);
+});
+
+test('messages and callbacks reject other owners and non-owner chats', async t => {
+  const { env, calls } = setup(t);
+  const sent = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url, init) => {
+    if (String(url).includes('api.telegram.org')) sent.push({ method: String(url).split('/').at(-1), body: JSON.parse(init.body) });
+    return originalFetch(url, init);
+  };
+  await app.processUpdate({ message: { from: { id: 2 }, chat: { id: 2, type: 'private' }, text: '/status' } }, env);
+  await app.processUpdate({ message: { from: { id: 1 }, chat: { id: 2, type: 'private' }, text: '/status' } }, env);
+  assert.equal(sent.length, 0);
+  await app.processUpdate({ message: { from: { id: 1 }, chat: { id: -100, type: 'supergroup' }, text: '/status' } }, env);
+  assert.equal(sent.length, 1);
+  assert.match(sent[0].body.text, /私聊/);
+  for (const [from, chat] of [[2, { id: 1, type: 'private' }], [1, { id: 1, type: 'supergroup' }], [1, { id: 2, type: 'private' }]]) {
+    await app.processUpdate({ callback_query: { id: `denied-${sent.length}`, from: { id: from }, data: 'home', message: { chat, message_id: 10 } } }, env);
+  }
+  assert.equal(sent.length, 4);
+  assert.ok(sent.slice(1).every(call => call.method === 'answerCallbackQuery' && call.body.show_alert === true));
+  assert.equal(calls.filter(url => url.includes('/devices?')).length, 0);
+});
+
 test('expired sync lease is fenced even if a new worker acquired it', async t => {
   const { db, env } = setup(t);
   const fetchImpl = globalThis.fetch;
