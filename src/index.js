@@ -23,6 +23,8 @@ const GEOIP_API = "https://api.country.is";
 const GEOIP_CACHE_SECONDS = 7 * 86400;
 const GEOIP_RETRY_SECONDS = 6 * 3600;
 const GEOIP_LOOKUPS_PER_SYNC = 5;
+const SYNC_ALERT_SECONDS = 5 * 60;
+const KEY_EXPIRY_WARNING_SECONDS = 7 * 86400;
 let oauthCache = { clientId: "", token: "", expiresAt: 0 };
 
 export default {
@@ -136,6 +138,12 @@ async function processCallback(query, env) {
 
 export async function runScheduledChecks(event, env) {
   await syncWarning(env);
+  try {
+    await updateSyncHealth(env);
+    await drainAuxiliaryAlerts(env, 5);
+  } catch (error) {
+    console.error("Auxiliary alert processing failed", safeError(error));
+  }
   await drainNotificationOutbox(env, 5);
   const scheduledSeconds = Math.floor(Number(event?.scheduledTime || Date.now()) / 1000);
   if (Math.floor(scheduledSeconds / 60) % 60 === 17) {
@@ -145,6 +153,10 @@ export async function runScheduledChecks(event, env) {
       env.STATUS_DB.prepare("DELETE FROM status_events WHERE created_at < ?").bind(scheduledSeconds - 90 * 86400),
       env.STATUS_DB.prepare(`
         DELETE FROM notification_outbox
+        WHERE (sent_at > 0 AND sent_at < ?) OR (failed_at > 0 AND failed_at < ?)
+      `).bind(scheduledSeconds - 90 * 86400, scheduledSeconds - 90 * 86400),
+      env.STATUS_DB.prepare(`
+        DELETE FROM auxiliary_alerts
         WHERE (sent_at > 0 AND sent_at < ?) OR (failed_at > 0 AND failed_at < ?)
       `).bind(scheduledSeconds - 90 * 86400, scheduledSeconds - 90 * 86400)
     ]);
@@ -206,16 +218,37 @@ export async function syncTailscaleDevices(env, notify) {
     "SELECT * FROM servers WHERE ports = 'tailscale'"
   ).all();
   const existingById = new Map((existingQuery.results || []).map((row) => [String(row.host), row]));
+  const hasBaseline = Number((await readState(env.STATUS_DB, 'visibility')).until_at || 0) > 0;
+  const fetchedIds = new Set(fetchedDevices.map((device) => device.id));
   const hiddenTags = new Set(String(env.HIDDEN_TAGS || "").split(",").map((tag) => tag.trim().toLowerCase()).filter(Boolean));
   const visibleDevices = fetchedDevices.filter((device) => !hasHiddenTag(device, hiddenTags));
   const devices = env.GEOIP_ENABLED === "true"
     ? await enrichDeviceCountries(visibleDevices, existingById, checkedAt)
     : visibleDevices.map((device) => ({ ...device, country: "" }));
   const statements = [];
-  for (const device of devices) {
-    statements.push(...persistTailscaleDevice(device, checkedAt, syncToken, env, notify, existingById.get(device.id), lease));
-  }
   const fence = "EXISTS (SELECT 1 FROM runtime_state WHERE key = 'sync' AND token = ? AND until_at > unixepoch())";
+  for (const device of devices) {
+    const existing = existingById.get(device.id);
+    statements.push(...persistTailscaleDevice(device, checkedAt, syncToken, env, notify, existing, lease));
+    if (notify && env.BOT_TOKEN && env.ADMIN_USER_ID) {
+      const payload = { deviceId: device.id, name: device.displayName };
+      if (hasBaseline && !existing) statements.push(auxiliaryAlertStatement(env.STATUS_DB,
+        `device-added:${device.id}:${syncToken}`, 'device_added', payload, checkedAt, lease));
+      const expiresAt = Math.floor(Date.parse(device.expires) / 1000);
+      if (Number.isFinite(expiresAt) && expiresAt > checkedAt && expiresAt <= checkedAt + KEY_EXPIRY_WARNING_SECONDS) {
+        statements.push(auxiliaryAlertStatement(env.STATUS_DB,
+          `key-expiring:${device.id}:${device.expires}`, 'key_expiring', { ...payload, expires: device.expires }, checkedAt, lease));
+      }
+    }
+  }
+  if (notify && hasBaseline && env.BOT_TOKEN && env.ADMIN_USER_ID) {
+    for (const row of existingQuery.results || []) {
+      if (Number(row.enabled) === 1 && !fetchedIds.has(String(row.host))) {
+        statements.push(auxiliaryAlertStatement(env.STATUS_DB,
+          `device-removed:${row.host}:${syncToken}`, 'device_removed', { deviceId: String(row.host), name: row.name }, checkedAt, lease));
+      }
+    }
+  }
   statements.push(env.STATUS_DB.prepare(`
     UPDATE servers SET enabled = 0, updated_at = ?
     WHERE ports = 'tailscale' AND enabled = 1 AND COALESCE(last_check_token, '') != ? AND ${fence}
@@ -231,6 +264,13 @@ export async function syncTailscaleDevices(env, notify) {
   await env.STATUS_DB.prepare("UPDATE runtime_state SET failures = 0, until_at = 0 WHERE key = 'tailscale'").run();
   return devices.length;
   } finally { await releaseLease(env.STATUS_DB, 'sync', lease); }
+}
+
+function auxiliaryAlertStatement(db, key, kind, payload, createdAt, lease) {
+  return db.prepare(`INSERT OR IGNORE INTO auxiliary_alerts(alert_key, kind, payload, next_attempt_at, created_at)
+    SELECT ?, ?, ?, ?, ? WHERE EXISTS
+      (SELECT 1 FROM runtime_state WHERE key = 'sync' AND token = ? AND until_at > unixepoch())`
+  ).bind(key, kind, JSON.stringify(payload), createdAt, createdAt, lease);
 }
 
 async function enrichDeviceCountries(devices, existingById, checkedAt, fetchImpl = fetch) {
@@ -397,6 +437,136 @@ async function sendStatusNotification(payload, env) {
     parse_mode: "HTML",
     reply_markup: { inline_keyboard: [[{ text: t(env.BOT_LANGUAGE, "viewDetails"), callback_data: `detail:${payload.id}:0` }]] }
   });
+}
+
+async function updateSyncHealth(env) {
+  if (!env.BOT_TOKEN || !env.ADMIN_USER_ID) return;
+  const lease = await acquireLease(env.STATUS_DB, 'monitor-health-lock', 120);
+  if (!lease) return;
+  try {
+    const now = nowSeconds();
+    await env.STATUS_DB.prepare("INSERT OR IGNORE INTO runtime_state(key, until_at) VALUES ('monitor-health', ?)").bind(now).run();
+    const state = await readState(env.STATUS_DB, 'monitor-health');
+    const visibility = await readState(env.STATUS_DB, 'visibility');
+    const lastSuccess = Math.max(0, Number(visibility.until_at || 0) - 120);
+    if (lastSuccess > 0 && now - lastSuccess < SYNC_ALERT_SECONDS) {
+      if (state.token) {
+        const lostKey = `sync-lost:${state.token}`;
+        const lost = await env.STATUS_DB.prepare("SELECT sent_at FROM auxiliary_alerts WHERE alert_key = ?").bind(lostKey).first();
+        const statement = lost?.sent_at > 0
+          ? env.STATUS_DB.prepare(`INSERT OR IGNORE INTO auxiliary_alerts(alert_key, kind, payload, next_attempt_at, created_at)
+              VALUES (?, 'sync_restored', '{}', ?, ?)`).bind(`sync-restored:${state.token}`, now, now)
+          : env.STATUS_DB.prepare("UPDATE auxiliary_alerts SET failed_at = ?, last_error = 'sync restored before delivery' WHERE alert_key = ? AND sent_at = 0 AND failed_at = 0").bind(now, lostKey);
+        await env.STATUS_DB.batch([
+          statement,
+          env.STATUS_DB.prepare("UPDATE runtime_state SET token = '', until_at = 0 WHERE key = 'monitor-health'")
+        ]);
+      } else if (state.until_at) {
+        await env.STATUS_DB.prepare("UPDATE runtime_state SET until_at = 0 WHERE key = 'monitor-health'").run();
+      }
+      return;
+    }
+    const episode = lastSuccess || Number(state.until_at || now);
+    if (!state.token && now - episode >= SYNC_ALERT_SECONDS) {
+      await env.STATUS_DB.batch([
+        env.STATUS_DB.prepare(`INSERT OR IGNORE INTO auxiliary_alerts(alert_key, kind, payload, next_attempt_at, created_at)
+          VALUES (?, 'sync_lost', '{}', ?, ?)`).bind(`sync-lost:${episode}`, now, now),
+        env.STATUS_DB.prepare("UPDATE runtime_state SET token = ? WHERE key = 'monitor-health'").bind(String(episode))
+      ]);
+    }
+  } finally { await releaseLease(env.STATUS_DB, 'monitor-health-lock', lease); }
+}
+
+async function drainAuxiliaryAlerts(env, limit) {
+  if (!env.BOT_TOKEN || !env.ADMIN_USER_ID) return;
+  const due = await env.STATUS_DB.prepare(`SELECT * FROM auxiliary_alerts
+    WHERE sent_at = 0 AND failed_at = 0 AND next_attempt_at <= ? AND lease_until <= ?
+    ORDER BY CASE WHEN kind LIKE 'sync_%' THEN 0 ELSE 1 END, id LIMIT ?`
+  ).bind(nowSeconds(), nowSeconds(), limit).all();
+  for (const alert of due.results || []) {
+    if ((await readState(env.STATUS_DB, 'telegram')).until_at > nowSeconds()) break;
+    await deliverAuxiliaryAlert(alert, env);
+  }
+}
+
+async function deliverAuxiliaryAlert(alert, env) {
+  const health = alert.kind === 'sync_lost' || alert.kind === 'sync_restored';
+  const healthLease = health ? await acquireLease(env.STATUS_DB, 'monitor-health-lock', 120) : '';
+  if (health && !healthLease) return;
+  try {
+    const leaseToken = crypto.randomUUID();
+    const now = nowSeconds();
+    const claimed = await env.STATUS_DB.prepare(`UPDATE auxiliary_alerts SET lease_token = ?, lease_until = ?
+      WHERE id = ? AND sent_at = 0 AND failed_at = 0 AND next_attempt_at <= ? AND lease_until <= ?`
+    ).bind(leaseToken, now + 60, alert.id, now, now).run();
+    if (Number(claimed.meta?.changes || 0) !== 1) return;
+    try {
+      const payload = JSON.parse(alert.payload);
+      const validity = await auxiliaryAlertValidity(alert, payload, env);
+      if (validity === 'wait') {
+        await env.STATUS_DB.prepare(`UPDATE auxiliary_alerts SET lease_token = '', lease_until = 0, next_attempt_at = ?
+          WHERE id = ? AND lease_token = ?`).bind(nowSeconds() + 60, alert.id, leaseToken).run();
+        return;
+      }
+      if (validity === 'cancel') {
+        await env.STATUS_DB.prepare(`UPDATE auxiliary_alerts SET failed_at = ?, last_error = 'condition no longer applies', lease_token = '', lease_until = 0
+          WHERE id = ? AND lease_token = ?`).bind(nowSeconds(), alert.id, leaseToken).run();
+        return;
+      }
+      await sendAuxiliaryAlert(alert.kind, payload, env);
+      await env.STATUS_DB.prepare(`UPDATE auxiliary_alerts SET sent_at = ?, last_error = '', lease_token = '', lease_until = 0
+        WHERE id = ? AND sent_at = 0 AND lease_token = ?`).bind(nowSeconds(), alert.id, leaseToken).run();
+    } catch (error) {
+      const plan = notificationFailurePlan(error, alert.attempts, nowSeconds());
+      if (plan.terminal) {
+        await env.STATUS_DB.prepare(`UPDATE auxiliary_alerts SET attempts = ?, failed_at = ?, last_error = ?, lease_token = '', lease_until = 0
+          WHERE id = ? AND sent_at = 0 AND lease_token = ?`
+        ).bind(plan.attempts, nowSeconds(), safeError(error), alert.id, leaseToken).run();
+      } else {
+        await env.STATUS_DB.prepare(`UPDATE auxiliary_alerts SET attempts = ?, next_attempt_at = ?, last_error = ?, lease_token = '', lease_until = 0
+          WHERE id = ? AND sent_at = 0 AND lease_token = ?`
+        ).bind(plan.attempts, plan.nextAttemptAt, safeError(error), alert.id, leaseToken).run();
+      }
+      console.error("Auxiliary alert failed", safeError(error));
+    }
+  } finally {
+    if (healthLease) await releaseLease(env.STATUS_DB, 'monitor-health-lock', healthLease);
+  }
+}
+
+async function auxiliaryAlertValidity(alert, payload, env) {
+  if (alert.kind === 'sync_lost') {
+    const state = await readState(env.STATUS_DB, 'monitor-health');
+    return state.token && alert.alert_key === `sync-lost:${state.token}` && !(await visibilityFresh(env)) ? 'send' : 'cancel';
+  }
+  if (alert.kind === 'sync_restored') {
+    if ((await readState(env.STATUS_DB, 'monitor-health')).token) return 'cancel';
+    return await visibilityFresh(env) ? 'send' : 'wait';
+  }
+  if (!(await visibilityFresh(env))) return 'wait';
+  const row = await env.STATUS_DB.prepare("SELECT enabled, last_results FROM servers WHERE host = ? AND ports = 'tailscale'")
+    .bind(payload.deviceId).first();
+  if (alert.kind === 'device_added') return Number(row?.enabled) === 1 ? 'send' : 'cancel';
+  if (alert.kind === 'device_removed') return row && Number(row.enabled) === 0 ? 'send' : 'cancel';
+  if (alert.kind === 'key_expiring') {
+    const expiresAt = Math.floor(Date.parse(payload.expires) / 1000);
+    return Number(row?.enabled) === 1 && parseDevice(row.last_results).expires === payload.expires &&
+      Number.isFinite(expiresAt) && expiresAt > nowSeconds() ? 'send' : 'cancel';
+  }
+  return 'cancel';
+}
+
+async function sendAuxiliaryAlert(kind, payload, env) {
+  const lang = env.BOT_LANGUAGE;
+  const name = escapeHtml(payload.name || '');
+  const messages = {
+    sync_lost: `⚠️ <b>${t(lang, 'syncLostTitle')}</b>\n${t(lang, 'syncLostBody')}`,
+    sync_restored: `🟢 <b>${t(lang, 'syncRestoredTitle')}</b>`,
+    device_added: `🆕 <b>${t(lang, 'deviceAddedTitle')}</b>\n<b>${name}</b>`,
+    device_removed: `⚪ <b>${t(lang, 'deviceRemovedTitle')}</b>\n<b>${name}</b>`,
+    key_expiring: `⚠️ <b>${t(lang, 'keyExpiringTitle')}</b>\n<b>${name}</b>\n${t(lang, 'keyExpires')}${t(lang, 'colon')}${formatTailscaleTime(payload.expires, env.TIME_ZONE, lang)}`
+  };
+  await telegram(env, 'sendMessage', { chat_id: env.ADMIN_USER_ID, text: messages[kind], parse_mode: 'HTML' });
 }
 
 async function syncWarning(env) {

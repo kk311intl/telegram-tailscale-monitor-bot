@@ -9,7 +9,7 @@ let source = readFileSync(new URL('../src/index.js', import.meta.url), 'utf8');
 for (const file of ['helpers.js', 'i18n.js', 'update-lifecycle.js', 'api-runtime.js']) {
   source = source.replace(JSON.stringify('./' + file), JSON.stringify(new URL('../src/' + file, import.meta.url).href));
 }
-source += '\nexport {editOrSend, enrichDeviceCountries, dashboardView, deviceListView, deviceDetailView, drainNotificationOutbox, sendStatusNotification};';
+source += '\nexport {editOrSend, enrichDeviceCountries, dashboardView, deviceListView, deviceDetailView, drainNotificationOutbox, sendStatusNotification, updateSyncHealth, drainAuxiliaryAlerts};';
 const app = await import('data:text/javascript;base64,' + Buffer.from(source).toString('base64'));
 const now = () => Math.floor(Date.now() / 1000);
 const response = (data, status = 200, headers = {}) => new Response(JSON.stringify(data), { status, headers });
@@ -133,6 +133,90 @@ test('messages and callbacks reject other owners and non-owner chats', async t =
   assert.equal(sent.length, 4);
   assert.ok(sent.slice(1).every(call => call.method === 'answerCallbackQuery' && call.body.show_alert === true));
   assert.equal(calls.filter(url => url.includes('/devices?')).length, 0);
+});
+
+test('stale sync alerts once and sends recovery only after an alert was delivered', async t => {
+  const { db, env } = setup(t);
+  await app.syncTailscaleDevices(env, true);
+  db.prepare("UPDATE runtime_state SET until_at = ? WHERE key = 'visibility'").run(now() - 181);
+  await app.updateSyncHealth(env);
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM auxiliary_alerts WHERE kind = 'sync_lost'").get().n, 1);
+  await app.updateSyncHealth(env);
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM auxiliary_alerts WHERE kind = 'sync_lost'").get().n, 1);
+  await app.drainAuxiliaryAlerts(env, 5);
+  assert.ok(db.prepare("SELECT sent_at FROM auxiliary_alerts WHERE kind = 'sync_lost'").get().sent_at > 0);
+  await app.syncTailscaleDevices(env, true);
+  await app.updateSyncHealth(env);
+  await app.drainAuxiliaryAlerts(env, 5);
+  assert.ok(db.prepare("SELECT sent_at FROM auxiliary_alerts WHERE kind = 'sync_restored'").get().sent_at > 0);
+});
+
+test('sync recovery cancels a lost alert that was never delivered', async t => {
+  const { db, env } = setup(t);
+  await app.syncTailscaleDevices(env, true);
+  db.prepare("UPDATE runtime_state SET until_at = ? WHERE key = 'visibility'").run(now() - 181);
+  await app.updateSyncHealth(env);
+  await app.syncTailscaleDevices(env, true);
+  await app.updateSyncHealth(env);
+  assert.ok(db.prepare("SELECT failed_at FROM auxiliary_alerts WHERE kind = 'sync_lost'").get().failed_at > 0);
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM auxiliary_alerts WHERE kind = 'sync_restored'").get().n, 0);
+});
+
+test('inventory alerts ignore first sync and hidden tags, then report visible changes', async t => {
+  const { db, env, devices } = setup(t);
+  env.HIDDEN_TAGS = 'tag:personal';
+  await app.syncTailscaleDevices(env, true);
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM auxiliary_alerts').get().n, 0);
+  devices.push({ id: 'n2', name: 'new.example.ts.net', connectedToControl: true, tags: [] });
+  await app.syncTailscaleDevices(env, true);
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM auxiliary_alerts WHERE kind = 'device_added'").get().n, 1);
+  devices[1].tags = ['tag:personal'];
+  await app.syncTailscaleDevices(env, true);
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM auxiliary_alerts WHERE kind = 'device_removed'").get().n, 0);
+  await app.drainAuxiliaryAlerts(env, 5);
+  assert.ok(db.prepare("SELECT failed_at FROM auxiliary_alerts WHERE kind = 'device_added'").get().failed_at > 0);
+  devices[1].tags = [];
+  await app.syncTailscaleDevices(env, true);
+  devices.pop();
+  await app.syncTailscaleDevices(env, true);
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM auxiliary_alerts WHERE kind = 'device_removed'").get().n, 1);
+  await app.drainAuxiliaryAlerts(env, 5);
+  assert.ok(db.prepare("SELECT sent_at FROM auxiliary_alerts WHERE kind = 'device_removed'").get().sent_at > 0);
+});
+
+test('key expiry alert is deduplicated and cancelled if the key is renewed', async t => {
+  const { db, env, devices } = setup(t);
+  devices[0].expires = new Date((now() + 3 * 86400) * 1000).toISOString();
+  await app.syncTailscaleDevices(env, true);
+  await app.syncTailscaleDevices(env, true);
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM auxiliary_alerts WHERE kind = 'key_expiring'").get().n, 1);
+  devices[0].expires = new Date((now() + 30 * 86400) * 1000).toISOString();
+  await app.syncTailscaleDevices(env, true);
+  await app.drainAuxiliaryAlerts(env, 5);
+  assert.ok(db.prepare("SELECT failed_at FROM auxiliary_alerts WHERE kind = 'key_expiring'").get().failed_at > 0);
+});
+
+test('auxiliary alerts respect Telegram retry-after without duplicate delivery', async t => {
+  const { db, env, devices } = setup(t);
+  await app.syncTailscaleDevices(env, true);
+  devices.push({ id: 'n2', name: 'second.example.ts.net', connectedToControl: true, tags: [] });
+  await app.syncTailscaleDevices(env, true);
+  const originalFetch = globalThis.fetch;
+  let sends = 0;
+  globalThis.fetch = async (url, init) => {
+    if (String(url).includes('api.telegram.org')) {
+      sends++;
+      if (sends === 1) return response({ ok: false, error_code: 429, parameters: { retry_after: 17 } }, 429);
+    }
+    return originalFetch(url, init);
+  };
+  await app.drainAuxiliaryAlerts(env, 5);
+  const row = db.prepare("SELECT attempts, sent_at, next_attempt_at FROM auxiliary_alerts WHERE kind = 'device_added'").get();
+  assert.equal(row.attempts, 1);
+  assert.equal(row.sent_at, 0);
+  assert.ok(row.next_attempt_at >= now() + 16);
+  await app.drainAuxiliaryAlerts(env, 5);
+  assert.equal(sends, 1);
 });
 
 test('expired sync lease is fenced even if a new worker acquired it', async t => {

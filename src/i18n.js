@@ -37,6 +37,13 @@ export const messages = {
     ageHours: (n) => `${n} 小時前`,
     ageDays: (n) => `${n} 天前`,
     syncFailed: "同步失敗，請稍後重試。",
+    syncLostTitle: "設備資料同步中斷",
+    syncLostBody: "已至少 5 分鐘未取得有效快照，設備狀態可能過期。",
+    syncRestoredTitle: "設備資料同步已恢復",
+    deviceAddedTitle: "新增設備",
+    deviceRemovedTitle: "設備已從 API 清單消失",
+    keyExpiringTitle: "設備金鑰即將到期",
+    keyExpires: "到期時間",
     colon: "："
   },
   ja: {
@@ -77,6 +84,13 @@ export const messages = {
     ageHours: (n) => `${n} 時間前`,
     ageDays: (n) => `${n} 日前`,
     syncFailed: "同期に失敗しました。しばらくしてからお試しください。",
+    syncLostTitle: "端末データの同期が停止",
+    syncLostBody: "有効なスナップショットを 5 分以上取得できていません。端末の状態は古い可能性があります。",
+    syncRestoredTitle: "端末データの同期が復旧",
+    deviceAddedTitle: "新しい端末",
+    deviceRemovedTitle: "端末が API の一覧から消失",
+    keyExpiringTitle: "端末キーの有効期限が近づいています",
+    keyExpires: "有効期限",
     colon: "："
   },
   en: {
@@ -117,6 +131,13 @@ export const messages = {
     ageHours: (n) => `${n} ${n === 1 ? "hour" : "hours"} ago`,
     ageDays: (n) => `${n} ${n === 1 ? "day" : "days"} ago`,
     syncFailed: "Sync failed. Please try again later.",
+    syncLostTitle: "Device sync interrupted",
+    syncLostBody: "No valid snapshot for at least 5 minutes. Device status may be stale.",
+    syncRestoredTitle: "Device sync restored",
+    deviceAddedTitle: "New device",
+    deviceRemovedTitle: "Device missing from API list",
+    keyExpiringTitle: "Device key expiring soon",
+    keyExpires: "Expires at",
     colon: ": "
   }
 };
