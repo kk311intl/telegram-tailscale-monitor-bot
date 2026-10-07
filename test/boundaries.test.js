@@ -40,10 +40,12 @@ test("configured tags are excluded and opt-in GeoIP work is bounded", () => {
   assert.match(source, /s\.enabled = 1/);
 });
 
-test("Telegram UI keeps Tailscale wording only in the main title", () => {
+test("Telegram UI uses a neutral title and preserves custom titles", () => {
   assert.match(source, /env\.BOT_TITLE \|\| t\(env\.BOT_LANGUAGE, "dashboardTitle"\)/);
   assert.match(translations, /deviceList: "設備列表"/);
   assert.match(translations, /refresh: "更新狀態"/);
+  assert.match(translations, /dashboardTitle: "伺服器狀態"/);
+  assert.doesNotMatch(translations, /Tailscale/);
   assert.match(source, /escapeHtml\(truncate\(env\.BOT_TITLE/);
   assert.doesNotMatch(source, /從 Tailscale 更新|Tailscale 設備列表|Tailscale 設備離線|Tailscale 設備恢復|Tailscale IP/);
 });
@@ -68,7 +70,7 @@ test("Telegram UI hides the tailnet name and recovery uses the previous offline 
   assert.match(notification, /formatTailscaleTime\(payload\.device\.lastSeen, env\.TIME_ZONE, env\.BOT_LANGUAGE\)/);
   assert.doesNotMatch(notification, /previousLastSeen|offlineConfirmed/);
   assert.match(translations, /lastOnline: "最後在線"/);
-  assert.match(translations, /lastSeen: "最後上線"/);
+  assert.doesNotMatch(translations, /lastSeen:/);
   assert.doesNotMatch(translations, /offlineConfirmed:/);
 });
 

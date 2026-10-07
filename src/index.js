@@ -651,11 +651,11 @@ async function dashboardView(env, warning = "", requestedPage = 0) {
       `🔴 ${t(env.BOT_LANGUAGE, "offline")}${t(env.BOT_LANGUAGE, "colon")}${devices.filter((item) => item.status === "down").length}`,
       `⚪ ${t(env.BOT_LANGUAGE, "pending")}${t(env.BOT_LANGUAGE, "colon")}${devices.filter((item) => item.status === "unknown").length}`,
       `📋 ${t(env.BOT_LANGUAGE, "total")}${t(env.BOT_LANGUAGE, "colon")}${devices.length}`,
-      warning ? `\n⚠️ ${t(env.BOT_LANGUAGE, "syncFailed")}` : "",
+      warning ? `\n⚠️ ${t(env.BOT_LANGUAGE, "syncFailed")}` : null,
       "",
       `<b>${t(env.BOT_LANGUAGE, "allDevices")}</b>${pages > 1 ? ` · ${page + 1}/${pages}` : ""}`,
       ...lines
-    ].filter(Boolean).join("\n"),
+    ].filter(line => line !== null).join("\n"),
     parse_mode: "HTML",
     reply_markup: mainKeyboard(env, page, pages)
   };
@@ -749,13 +749,13 @@ async function deviceDetailView(env, id, page, warning = "") {
       `${statusIcon(row.status)} <b>${escapeHtml(label)}</b>`,
       `${t(env.BOT_LANGUAGE, "status")}${t(env.BOT_LANGUAGE, "colon")}${statusLabel(row.status, env.BOT_LANGUAGE)}`,
       `${t(env.BOT_LANGUAGE, "system")}${t(env.BOT_LANGUAGE, "colon")}${escapeHtml(device.os || t(env.BOT_LANGUAGE, "unknown"))}`,
-      `${t(env.BOT_LANGUAGE, "lastSeen")}${t(env.BOT_LANGUAGE, "colon")}${formatTailscaleTime(device.lastSeen, env.TIME_ZONE, env.BOT_LANGUAGE)}`,
+      `${t(env.BOT_LANGUAGE, "lastOnline")}${t(env.BOT_LANGUAGE, "colon")}${formatTailscaleTime(device.lastSeen, env.TIME_ZONE, env.BOT_LANGUAGE)}`,
       `${t(env.BOT_LANGUAGE, "apiSync")}${t(env.BOT_LANGUAGE, "colon")}${formatAge(row.last_checked_at, undefined, env.BOT_LANGUAGE)}`,
       warning ? `\n⚠️ ${t(env.BOT_LANGUAGE, "syncFailed")}` : ""
     ].filter(Boolean).join("\n"),
     parse_mode: "HTML",
     reply_markup: { inline_keyboard: [
-      [{ text: `🔄 ${t(env.BOT_LANGUAGE, "syncNow")}`, callback_data: `check:${row.id}:${page}` }],
+      [{ text: `🔄 ${t(env.BOT_LANGUAGE, "refresh")}`, callback_data: `check:${row.id}:${page}` }],
       [{ text: t(env.BOT_LANGUAGE, "backList"), callback_data: `list:${page}` }, { text: t(env.BOT_LANGUAGE, "backOverview"), callback_data: "home" }]
     ] }
   };

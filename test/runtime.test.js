@@ -548,7 +548,7 @@ test('personal tag after 32 entries hides device and cancels unsent notification
   await app.syncTailscaleDevices(env, false);
   assert.equal(db.prepare('SELECT enabled FROM servers').get().enabled, 0);
   assert.ok(db.prepare('SELECT failed_at FROM notification_outbox').get().failed_at > 0);
-  assert.match((await app.deviceDetailView(env, 1, 0)).text, /已移除或隱藏/);
+  assert.match((await app.deviceDetailView(env, 1, 0)).text, /已不在清單中/);
 });
 
 test('GeoIP is opt-in and the title is escaped', async t => {
@@ -618,7 +618,7 @@ test('sync failure does not stop pending delivery with fresh visibility, stale v
   assert.ok(db.prepare('SELECT sent_at FROM notification_outbox').get().sent_at > 0);
   db.exec("UPDATE runtime_state SET until_at = 1 WHERE key = 'visibility'");
   const view = await app.dashboardView(env);
-  assert.match(view.text, /已過期/);
+  assert.match(view.text, /暫無最新設備資料/);
   assert.ok(!view.text.includes('node'));
 });
 
@@ -714,14 +714,20 @@ test('deployment language controls views and scheduled notification text', async
     return response({ ok: true, result: true });
   };
   for (const [lang, online, list, lastSeen, offline, recovered] of [
-    ['zh', '在線', '設備列表', '最後上線', '最後在線', '恢復時間'],
-    ['ja', 'オンライン', '端末一覧', '最終接続', '最終オンライン', '復旧時刻'],
-    ['en', 'Online', 'Device list', 'Last seen online', 'Last online', 'Recovered at']
+    ['zh', '在線', '設備列表', '最後在線', '最後在線', '恢復時間'],
+    ['ja', 'オンライン', '端末一覧', '最終オンライン', '最終オンライン', '復旧時刻'],
+    ['en', 'Online', 'Device list', 'Last online', 'Last online', 'Recovered at']
   ]) {
     env.BOT_LANGUAGE = lang;
     assert.match((await app.dashboardView(env)).text, new RegExp(online));
     assert.match((await app.deviceListView(env, 0)).text, new RegExp(list));
     assert.match((await app.deviceDetailView(env, 1, 0)).text, new RegExp(lastSeen));
+    const overview = await app.dashboardView(env);
+    const detail = await app.deviceDetailView(env, 1, 0);
+    assert.equal(overview.reply_markup.inline_keyboard[0][1].text, detail.reply_markup.inline_keyboard[0][0].text);
+    assert.match(overview.text, /^<b>[^\n]+<\/b>\n\n/);
+    assert.match(overview.text, /\n\n<b>[^\n]+<\/b>\n🟢/);
+    assert.doesNotMatch(overview.text, /\n\n\n/);
     await app.sendStatusNotification({ id: 1, name: 'node', device: { lastSeen: '2026-09-01T00:00:00Z' }, event: 'down', eventTime: 1 }, env);
     assert.match(sent.at(-1).text, new RegExp(offline));
     assert.match(sent.at(-1).text, /2026-09-01 00:00:00 UTC\+0/);
