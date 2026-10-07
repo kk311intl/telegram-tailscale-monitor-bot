@@ -54,6 +54,45 @@ test('concurrent sync cannot hide valid devices', async t => {
   assert.equal(db.prepare('SELECT enabled FROM servers').get().enabled, 1);
 });
 
+test('Cron delegates to its private scheduler and surfaces failed execution', async t => {
+  const { env, calls } = setup(t);
+  const scheduledTime = Date.now();
+  let pending;
+  let forwarded;
+  let status = 200;
+  env.SCHEDULER = { getByName(name) {
+    assert.equal(name, 'monitor');
+    return { async fetch(url, init) {
+      forwarded = JSON.parse(init.body);
+      return response({ ok: status === 200 }, status);
+    } };
+  } };
+  const ctx = { waitUntil(promise) { pending = promise; } };
+  await app.default.scheduled({ scheduledTime }, env, ctx);
+  await pending;
+  assert.deepEqual(forwarded, { scheduledTime });
+  assert.equal(calls.length, 0);
+  status = 500;
+  await app.default.scheduled({ scheduledTime }, env, ctx);
+  await assert.rejects(pending, /Scheduled checks failed: HTTP 500/);
+});
+
+test('private scheduler validates requests and drains the original D1 notification queue', async t => {
+  const { db, env, calls } = setup(t);
+  const scheduler = new app.StatusScheduler({}, env);
+  for (const body of ['null', '{}', 'not-json', '{"scheduledTime":-1}']) {
+    assert.equal((await scheduler.fetch(new Request('https://scheduler/checks', { method: 'POST', body }))).status, 400);
+  }
+  assert.equal((await scheduler.fetch(new Request('https://scheduler/checks'))).status, 405);
+  assert.equal(calls.length, 0);
+  assert.equal((await app.default.fetch(new Request('https://public.example/checks', { method: 'POST', body: '{}' }), env)).status, 404);
+  await app.syncTailscaleDevices(env, false);
+  db.prepare("INSERT INTO notification_outbox(server_id,check_token,event,payload,created_at) VALUES (1,'scheduler','down',?,1)").run(JSON.stringify({ id: 1, name: 'node', device: {}, event: 'down', eventTime: 1 }));
+  const result = await scheduler.fetch(new Request('https://scheduler/checks', { method: 'POST', body: JSON.stringify({ scheduledTime: Date.now() }) }));
+  assert.equal(result.status, 200);
+  assert.equal(db.prepare("SELECT sent_at FROM notification_outbox WHERE check_token='scheduler'").get().sent_at > 0, true);
+});
+
 test('message and button refresh render the same dashboard', async t => {
   const { env } = setup(t);
   const fetchImpl = globalThis.fetch;

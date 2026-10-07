@@ -26,7 +26,7 @@ README、AI 提示詞與 Bot 介面／通知皆支援中文、日文、英文；
 
 `BOT_TITLE` 留空時，總覽標題跟隨 `BOT_LANGUAGE` 顯示；時區預設為 UTC，亦可自行設定 IANA 時區。
 
-需要 Node.js 22.13+、pnpm 11+、Cloudflare Workers/D1、Telegram Bot，以及只授予 `devices:core:read` 的 Tailscale OAuth Client。註冊 Webhook 的腳本需要 PowerShell 7。OAuth Client Secret 不是 Tailscale Auth key。
+需要 Node.js 22.13+、pnpm 11+、Cloudflare Workers/D1/SQLite Durable Objects、Telegram Bot，以及只授予 `devices:core:read` 的 Tailscale OAuth Client。註冊 Webhook 的腳本需要 PowerShell 7。OAuth Client Secret 不是 Tailscale Auth key。
 
 ```powershell
 pnpm install --frozen-lockfile
@@ -61,7 +61,9 @@ Telegram 私聊 `/start` 顯示最近的有效快照；`/status` 同步並顯示
 
 此外，Bot 會在有效設備快照中斷至少 5 分鐘及恢復時通知，並通知可見設備首次加入或從 API 清單消失。若 API 提供設備金鑰到期時間，會在到期前 7 天內提醒一次；金鑰更新後可再次提醒。首次建立設備清單不發新增通知。這些通知依賴 Worker 排程、D1 與 Telegram，不能在 Worker 本身停止運作時即時告警。
 
-同步完成後優先發送離線／恢復通知，再處理輔助提醒與清理；時間格式器會重用以降低排程 CPU 開銷。排程中斷、API 故障或 Telegram 限流仍可能延遲通知。遇到延遲時，對照 D1 `notification_outbox` 的 `created_at`／`sent_at` 與 Worker 日誌；「最後在線」不是通知建立時間。
+Cron 每分鐘喚起私有 `SCHEDULER` SQLite Durable Object 執行同步與通知，避開免費 Cron 的 10 ms CPU 上限；設備與通知資料仍存 D1。首次部署時 Wrangler 自動套用範例中的 `scheduler-v1` migration；從舊版升級須把範例的 `durable_objects` 和 `migrations` 一併加入自己的設定。SQLite Durable Objects 支援免費方案，實際用量受 [Cloudflare 配額](https://developers.cloudflare.com/durable-objects/platform/pricing/) 限制。
+
+同步完成後優先發送離線／恢復通知，再處理輔助提醒與清理；時間格式器會重用。排程中斷、API 故障或 Telegram 限流仍可能延遲通知。遇到延遲時，對照 D1 `notification_outbox` 的 `created_at`／`sent_at` 與 Worker 日誌；「最後在線」不是通知建立時間。
 
 ```powershell
 Invoke-RestMethod https://YOUR_WORKER.workers.dev/health
@@ -90,7 +92,7 @@ README、AI プロンプト、Bot の画面と通知は中国語・日本語・�
 
 `BOT_TITLE` が空なら、概要の見出しは `BOT_LANGUAGE` に合わせて表示されます。タイムゾーンは既定で UTC であり、IANA 名で変更できます。
 
-Node.js 22.13+、pnpm 11+、Cloudflare Workers/D1、Telegram Bot、`devices:core:read` のみを許可した Tailscale OAuth クライアントが必要です。Webhook 登録スクリプトには PowerShell 7 を使います。OAuth Client Secret は Tailscale の Auth key ではありません。
+Node.js 22.13+、pnpm 11+、Cloudflare Workers/D1/SQLite Durable Objects、Telegram Bot、`devices:core:read` のみを許可した Tailscale OAuth クライアントが必要です。Webhook 登録スクリプトには PowerShell 7 を使います。OAuth Client Secret は Tailscale の Auth key ではありません。
 
 ```powershell
 pnpm install --frozen-lockfile
@@ -125,7 +127,9 @@ Telegram の個人チャットで `/start` は有効な最新スナップショ�
 
 有効な端末スナップショットが 5 分以上途絶えた場合と復旧時、表示対象の端末が API の一覧に追加・削除された場合にも通知します。API にキーの有効期限がある端末は、期限前 7 日以内に一度通知し、キー更新後は再通知できます。初回の端末一覧作成では追加通知を送りません。これらの通知は Worker のスケジュール、D1、Telegram に依存するため、Worker 自体が停止した場合の即時警報にはなりません。
 
-同期後はオフライン／復旧通知を優先し、補助通知とクリーンアップを後で処理します。日時フォーマッターを再利用して定期処理の CPU 使用量を減らします。スケジュールの中断、API 障害、Telegram のレート制限で通知が遅れる場合は、D1 の `notification_outbox` の `created_at`／`sent_at` と Worker ログを確認してください。最終オンライン時刻は通知の作成時刻ではありません。
+Cron は毎分、非公開の SQLite Durable Object `SCHEDULER` に同期と通知を渡し、無料 Cron の 10 ms CPU 制限を避けます。端末と通知のデータは引き続き D1 に保存します。初回 deploy で Wrangler が例の `scheduler-v1` migration を適用します。旧版からの更新では、例の `durable_objects` と `migrations` を自分の設定にも追加してください。SQLite Durable Objects は無料プランでも利用でき、[Cloudflare の利用枠](https://developers.cloudflare.com/durable-objects/platform/pricing/) が適用されます。
+
+同期後はオフライン／復旧通知を優先し、補助通知とクリーンアップを後で処理します。日時フォーマッターを再利用します。スケジュールの中断、API 障害、Telegram のレート制限で通知が遅れる場合は、D1 の `notification_outbox` の `created_at`／`sent_at` と Worker ログを確認してください。最終オンライン時刻は通知の作成時刻ではありません。
 
 ```powershell
 Invoke-RestMethod https://YOUR_WORKER.workers.dev/health
@@ -154,7 +158,7 @@ License: This project is licensed under [GNU GPL v3.0 only](LICENSE). Copyright 
 
 When `BOT_TITLE` is empty, the dashboard title follows `BOT_LANGUAGE`. The default time zone is UTC; set another IANA zone if needed.
 
-You need Node.js 22.13+, pnpm 11+, Cloudflare Workers/D1, a Telegram bot, and a Tailscale OAuth client with only `devices:core:read`. The webhook registration script requires PowerShell 7. An OAuth client secret is not a Tailscale auth key.
+You need Node.js 22.13+, pnpm 11+, Cloudflare Workers/D1/SQLite Durable Objects, a Telegram bot, and a Tailscale OAuth client with only `devices:core:read`. The webhook registration script requires PowerShell 7. An OAuth client secret is not a Tailscale auth key.
 
 ```powershell
 pnpm install --frozen-lockfile
@@ -189,7 +193,9 @@ In a private Telegram chat, `/start` shows the latest valid snapshot, `/status` 
 
 The bot also alerts when valid device snapshots stop for at least five minutes and when sync recovers, or when a visible device appears in or disappears from the API list. If the API supplies a device key expiry, it alerts once within seven days of expiry and can alert again after a key change. The initial inventory does not generate new-device alerts. These alerts depend on the Worker schedule, D1, and Telegram; they cannot provide an immediate warning if the Worker itself stops running.
 
-After syncing, offline/recovery notifications run before auxiliary alerts and cleanup. Date formatters are reused to reduce scheduled CPU usage. Interrupted schedules, API outages, or Telegram rate limits can still delay delivery. Compare `created_at`/`sent_at` in D1's `notification_outbox` with Worker logs when investigating delays; the last-online timestamp is not the notification creation time.
+Cron invokes the private SQLite Durable Object `SCHEDULER` each minute to run sync and notifications outside the free Cron's 10 ms CPU limit. Device and notification data remain in D1. Wrangler applies the example's `scheduler-v1` migration on first deployment. When upgrading an older configuration, copy both `durable_objects` and `migrations` from the example into your config. SQLite Durable Objects support the free plan and are subject to [Cloudflare quotas](https://developers.cloudflare.com/durable-objects/platform/pricing/).
+
+After syncing, offline/recovery notifications run before auxiliary alerts and cleanup. Date formatters are reused. Interrupted schedules, API outages, or Telegram rate limits can still delay delivery. Compare `created_at`/`sent_at` in D1's `notification_outbox` with Worker logs when investigating delays; the last-online timestamp is not the notification creation time.
 
 ```powershell
 Invoke-RestMethod https://YOUR_WORKER.workers.dev/health

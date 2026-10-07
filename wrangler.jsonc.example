@@ -22,6 +22,10 @@
       "migrations_dir": "migrations"
     }
   ],
+  "durable_objects": {
+    "bindings": [{ "name": "SCHEDULER", "class_name": "StatusScheduler" }]
+  },
+  "migrations": [{ "tag": "scheduler-v1", "new_sqlite_classes": ["StatusScheduler"] }],
   "triggers": {
     "crons": ["* * * * *"]
   },

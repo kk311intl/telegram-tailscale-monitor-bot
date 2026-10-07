@@ -128,7 +128,7 @@ test("endpoint parsing keeps IPv4 preference and stops once a public IPv4 is fou
   assert.equal(unnecessaryReads, 0);
 });
 
-test("fast endpoint parsing preserves URL address and port validation", () => {
+test("endpoint parsing preserves URL address and port validation", () => {
   for (const endpoint of ["8.8.8.8:0", "8.8.8.8:65535", "8.8.8.8:00443", "008.008.008.008:443", "08.8.8.8:443"]) {
     assert.equal(extractPublicEndpoint([endpoint]), new URL(`udp://${endpoint}`).hostname);
   }

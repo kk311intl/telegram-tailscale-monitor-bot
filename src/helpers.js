@@ -107,8 +107,6 @@ export function extractPublicEndpoint(endpoints) {
 function endpointHost(value) {
   const text = boundedText(value, 128);
   if (!text) return "";
-  const ipv4 = text.match(/^((?:0|[1-9]\d{0,2})(?:\.(?:0|[1-9]\d{0,2})){3}):(\d{1,5})$/);
-  if (ipv4 && Number(ipv4[2]) <= 65535 && ipv4Number(ipv4[1]) !== null) return ipv4[1];
   try {
     return new URL(`udp://${text}`).hostname.replace(/^\[|\]$/g, "").toLowerCase();
   } catch { return ""; }

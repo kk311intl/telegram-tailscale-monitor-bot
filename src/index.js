@@ -73,9 +73,29 @@ export default {
   },
 
   async scheduled(event, env, ctx) {
-    ctx.waitUntil(runScheduledChecks(event, env));
+    ctx.waitUntil(env.SCHEDULER.getByName("monitor").fetch("https://scheduler/checks", {
+      method: "POST", body: JSON.stringify({ scheduledTime: event.scheduledTime })
+    }).then(response => {
+      if (!response.ok) throw new Error(`Scheduled checks failed: HTTP ${response.status}`);
+    }));
   }
 };
+
+export class StatusScheduler {
+  constructor(ctx, env) { this.env = env; }
+
+  async fetch(request) {
+    if (request.method !== "POST") return new Response("Method not allowed", { status: 405 });
+    let event;
+    try { event = await request.json(); }
+    catch { return new Response("Bad request", { status: 400 }); }
+    if (!Number.isSafeInteger(event?.scheduledTime) || event.scheduledTime < 0) {
+      return new Response("Bad request", { status: 400 });
+    }
+    await runScheduledChecks(event, this.env);
+    return json({ ok: true });
+  }
+}
 
 export async function processUpdate(update, env) {
   if (update.callback_query) return processCallback(update.callback_query, env);
