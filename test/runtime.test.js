@@ -9,7 +9,7 @@ let source = readFileSync(new URL('../src/index.js', import.meta.url), 'utf8');
 for (const file of ['helpers.js', 'i18n.js', 'update-lifecycle.js', 'api-runtime.js']) {
   source = source.replace(JSON.stringify('./' + file), JSON.stringify(new URL('../src/' + file, import.meta.url).href));
 }
-source += '\nexport {editOrSend, enrichDeviceCountries, dashboardView, deviceListView, deviceDetailView, drainNotificationOutbox, sendStatusNotification, updateSyncHealth, drainAuxiliaryAlerts, truncate};';
+source += '\nexport {editOrSend, enrichDeviceCountries, dashboardView, deviceListView, deviceDetailView, drainNotificationOutbox, sendStatusNotification, updateSyncHealth, drainAuxiliaryAlerts, truncate, markDeliverySent, recordDeliveryFailure};';
 const app = await import('data:text/javascript;base64,' + Buffer.from(source).toString('base64'));
 const now = () => Math.floor(Date.now() / 1000);
 const response = (data, status = 200, headers = {}) => new Response(JSON.stringify(data), { status, headers });
@@ -73,6 +73,23 @@ test('invalid list pages cannot produce broken Telegram callback data', async t 
   }
 });
 
+test('overview and list retain their distinct out-of-range page fallbacks', async t => {
+  const { env, devices } = setup(t);
+  devices.push(...Array.from({ length: 20 }, (_, i) => ({ id: 'fallback-' + i, name: 'fallback-' + i, connectedToControl: true })));
+  await app.syncTailscaleDevices(env, false);
+  const overview = await app.dashboardView(env, '', 99);
+  const list = await app.deviceListView(env, 99);
+  assert.match(overview.text, /1\/3/);
+  assert.ok(overview.reply_markup.inline_keyboard.flat().some(button => button.callback_data === 'home:0'));
+  assert.ok(list.reply_markup.inline_keyboard.flat().some(button => button.text === '3/3' && button.callback_data === 'list:2'));
+  for (const page of [0, 1, 2]) {
+    const view = await app.deviceListView(env, page);
+    const callbacks = view.reply_markup.inline_keyboard.flat().map(button => button.callback_data);
+    assert.equal(callbacks.includes(`list:${page - 1}`), page > 0);
+    assert.equal(callbacks.includes(`list:${page + 1}`), page < 2);
+  }
+});
+
 test('a recovering device cannot overtake its earlier offline notification retry', async t => {
   const { db, env } = setup(t);
   await app.syncTailscaleDevices(env, false);
@@ -88,6 +105,38 @@ test('a recovering device cannot overtake its earlier offline notification retry
   await app.drainNotificationOutbox(env, 5);
   await app.drainNotificationOutbox(env, 5);
   assert.equal(sends, 2);
+});
+
+test('shared delivery writers preserve terminal/retry fields and fence both queues by lease', async t => {
+  const { db, env } = setup(t);
+  await app.syncTailscaleDevices(env, false);
+  db.exec("INSERT INTO notification_outbox(server_id,check_token,event,payload,created_at) VALUES(1,'writer','down','{}',1)");
+  db.exec("INSERT INTO auxiliary_alerts(alert_key,kind,created_at) VALUES('writer','device_added',1)");
+  for (const table of ['notification_outbox', 'auxiliary_alerts']) {
+    db.exec(`UPDATE ${table} SET lease_token='owned',lease_until=100,next_attempt_at=123`);
+    await app.recordDeliveryFailure(env.STATUS_DB, table, { id: 1, attempts: 0 }, 'owned', new SyntaxError('invalid'));
+    let row = db.prepare(`SELECT * FROM ${table} WHERE id=1`).get();
+    assert.ok(row.failed_at > 0);
+    assert.equal(row.next_attempt_at, 123);
+    assert.equal(row.lease_token, '');
+    db.exec(`UPDATE ${table} SET failed_at=0,lease_token='owned',lease_until=100`);
+    const before = now();
+    await app.recordDeliveryFailure(env.STATUS_DB, table, { id: 1, attempts: 1 }, 'owned', { telegramErrorCode: 429, retryAfter: 5, message: 'limited' });
+    row = db.prepare(`SELECT * FROM ${table} WHERE id=1`).get();
+    assert.equal(row.failed_at, 0);
+    assert.equal(row.attempts, 2);
+    assert.ok(row.next_attempt_at >= before + 5 && row.next_attempt_at <= now() + 5);
+    const unchanged = { ...row };
+    await app.markDeliverySent(env.STATUS_DB, table, 1, 'lost');
+    await app.recordDeliveryFailure(env.STATUS_DB, table, row, 'lost', new SyntaxError('stale'));
+    assert.deepEqual({ ...db.prepare(`SELECT * FROM ${table} WHERE id=1`).get() }, unchanged);
+    db.exec(`UPDATE ${table} SET lease_token='owned',lease_until=100`);
+    await app.markDeliverySent(env.STATUS_DB, table, 1, 'owned');
+    row = db.prepare(`SELECT * FROM ${table} WHERE id=1`).get();
+    assert.ok(row.sent_at > 0);
+    assert.equal(row.lease_until, 0);
+    assert.equal(row.last_error, '');
+  }
 });
 
 test('auxiliary device alerts hold the visibility lock during external delivery', async t => {

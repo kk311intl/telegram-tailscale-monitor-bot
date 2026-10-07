@@ -8,13 +8,15 @@ param(
         $uri.Scheme -eq 'https' -and $uri.Host -and -not $uri.UserInfo -and
         -not $uri.Query -and -not $uri.Fragment -and $uri.AbsolutePath -eq '/'
     }, ErrorMessage = 'WorkerUrl must be an HTTPS root URL without credentials, path, query or fragment.')]
-    [string]$WorkerUrl
+    [string]$WorkerUrl,
+    [Security.SecureString]$SecureWebhookSecret,
+    [string]$ConfigPath
 )
 
 $ErrorActionPreference = 'Stop'
 $WorkerUrl = ([Uri]$WorkerUrl).GetLeftPart([UriPartial]::Authority)
 $projectRoot = Split-Path -Parent $PSScriptRoot
-$configPath = Join-Path $projectRoot 'wrangler.jsonc'
+$configPath = if ($ConfigPath) { $ConfigPath } else { Join-Path $projectRoot 'wrangler.jsonc' }
 $botLanguage = if (Test-Path -LiteralPath $configPath) { (Get-Content -Raw -LiteralPath $configPath | ConvertFrom-Json).vars.BOT_LANGUAGE } else { 'zh' }
 $startDescription = switch ($botLanguage) {
     'ja' { 'サーバーの状態を確認' }
@@ -22,7 +24,7 @@ $startDescription = switch ($botLanguage) {
     default { '開啟伺服器狀態監控' }
 }
 $botTokenSecure = Read-Host '輸入 Telegram Bot Token（不會顯示或保存）' -AsSecureString
-$webhookSecretSecure = Read-Host '輸入已設定於 Worker 的 WEBHOOK_SECRET（不會顯示或保存）' -AsSecureString
+$webhookSecretSecure = if ($null -ne $SecureWebhookSecret) { $SecureWebhookSecret } else { Read-Host '輸入已設定於 Worker 的 WEBHOOK_SECRET（不會顯示或保存）' -AsSecureString }
 $botCredential = [PSCredential]::new('telegram', $botTokenSecure)
 $secretCredential = [PSCredential]::new('webhook', $webhookSecretSecure)
 function Invoke-TelegramBotApi {

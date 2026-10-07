@@ -14,12 +14,12 @@ export async function claimUpdate(database, updateId, now = nowSeconds()) {
        OR (processed_updates.status = 'processing' AND processed_updates.lease_until <= ?)
   `).bind(updateId, now, leaseToken, now + UPDATE_LEASE_SECONDS, now).run();
   if (Number(result.meta.changes || 0) === 1) {
-    return { state: "claimed", updateId, leaseToken, committed: false };
+    return { state: "claimed", updateId, leaseToken };
   }
   const existing = await database.prepare(
     "SELECT status FROM processed_updates WHERE update_id = ?"
   ).bind(updateId).first();
-  return { state: existing?.status === "done" ? "done" : "busy", updateId, leaseToken: "", committed: false };
+  return { state: existing?.status === "done" ? "done" : "busy", updateId, leaseToken: "" };
 }
 
 export async function completeUpdate(database, context) {
@@ -28,7 +28,6 @@ export async function completeUpdate(database, context) {
     WHERE update_id = ? AND status = 'processing' AND lease_token = ?
   `).bind(context.updateId, context.leaseToken).run();
   if (Number(result.meta.changes || 0) !== 1) throw new Error("Webhook update completion lease lost");
-  context.committed = true;
 }
 
 export async function releaseUpdate(database, context, error) {

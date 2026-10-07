@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { claimUpdate, completeUpdate, releaseUpdate } from "../src/update-lifecycle.js";
 
-function databaseStub({ changes = 1, status = "processing", batchResults = null } = {}) {
+function databaseStub({ changes = 1, status = "processing" } = {}) {
   const calls = [];
   return {
     calls,
@@ -15,10 +15,6 @@ function databaseStub({ changes = 1, status = "processing", batchResults = null 
         async first() { calls.push({ type: "first", sql, values: this.values }); return { status }; }
       };
       return statement;
-    },
-    async batch(statements) {
-      calls.push({ type: "batch", statements });
-      return batchResults || statements.map(() => ({ meta: { changes: 1 } }));
     }
   };
 }
@@ -28,7 +24,6 @@ test("a new webhook update receives a processing lease", async () => {
   const context = await claimUpdate(database, 123, 1000);
   assert.equal(context.state, "claimed");
   assert.equal(context.updateId, 123);
-  assert.equal(context.committed, false);
   assert.ok(context.leaseToken);
   assert.deepEqual(database.calls[0].values.slice(0, 2), [123, 1000]);
   assert.equal(database.calls[0].values[3], 1180);
@@ -42,18 +37,19 @@ test("completed and in-flight duplicate updates are distinguished", async () => 
 });
 
 test("completing an update requires the matching lease", async () => {
-  const context = { updateId: 20, leaseToken: "lease", committed: false };
-  await completeUpdate(databaseStub(), context);
-  assert.equal(context.committed, true);
+  const context = { updateId: 20, leaseToken: "lease" };
+  const database = databaseStub();
+  await completeUpdate(database, context);
+  assert.deepEqual(database.calls[0].values, [20, "lease"]);
   await assert.rejects(
-    completeUpdate(databaseStub({ changes: 0 }), { ...context, committed: false }),
+    completeUpdate(databaseStub({ changes: 0 }), context),
     /completion lease lost/
   );
 });
 
 test("failed pre-commit updates are released for retry", async () => {
   const database = databaseStub();
-  const context = { updateId: 30, leaseToken: "lease", committed: false };
+  const context = { updateId: 30, leaseToken: "lease" };
   await releaseUpdate(database, context, new Error("temporary\nerror"));
   assert.deepEqual(database.calls[0].values, ["temporary error", 30, "lease"]);
 });

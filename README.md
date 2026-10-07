@@ -2,7 +2,7 @@
 
 [中文](#zh-tw) · [日本語](#ja) · [English](#en)
 
-版本 / バージョン / Version：`v1.4.3`
+版本 / バージョン / Version：`v1.4.4`
 
 
 <a id="zh-tw"></a>
@@ -56,6 +56,8 @@ pwsh -File ./tools/Register-TelegramWebhook.ps1 -WorkerUrl https://YOUR_WORKER.w
 ```
 
 最後一步會隱藏輸入 Bot Token 與同一個 Webhook Secret，向 Telegram 註冊 `/webhook`、`/start` 命令及選單。使用 HTTPS 根網址，不帶路徑、帳密、查詢或片段；正式網址變更後需重新註冊 Webhook。正式 Secret 應保存在 Cloudflare，不要提交 `.dev.vars`、`wrangler.jsonc`、資料庫匯出或日誌。
+
+註冊工具可用 `-ConfigPath` 指定部署設定，並接受同一 PowerShell 程序內的 `-SecureWebhookSecret`（SecureString）；不要以明文命令列參數傳入 Secret。省略這些參數時仍使用預設設定與隱藏輸入。
 
 ### 使用與驗證
 
@@ -129,6 +131,8 @@ pwsh -File ./tools/Register-TelegramWebhook.ps1 -WorkerUrl https://YOUR_WORKER.w
 
 最後の手順では Bot Token と同じ Webhook Secret を非表示で入力し、`/webhook`、`/start`、Telegram メニューを登録します。HTTPS のルート URL を指定し、パス・認証情報・クエリ・フラグメントは付けないでください。URL を変えた場合は再登録が必要です。運用用の Secret は Cloudflare に保存し、`.dev.vars`、`wrangler.jsonc`、データベースのエクスポートやログをコミットしないでください。
 
+登録スクリプトは `-ConfigPath` で設定を指定でき、同じ PowerShell プロセス内の `-SecureWebhookSecret`（SecureString）も受け取れます。平文の Secret をコマンド引数にしないでください。省略時は既定の設定と非表示入力を使います。
+
 ### 使い方と確認
 
 Telegram の個人チャットで `/start` は有効な最新スナップショット、`/status` は同期と概要、`/list` は端末一覧、`/device ID` は詳細を表示します。概要と端末一覧は 1 ページ 10 台で、ボタンからページを切り替えられます。操作できるのは `ADMIN_USER_ID` のみです。Worker は毎分同期し、60 秒以上離れた有効なオフライン観測が 2 回続くとオフラインと判定します。一時的な API 障害ではオフラインにせず、`HIDDEN_TAGS` に指定した端末を非表示にします。
@@ -200,6 +204,8 @@ pwsh -File ./tools/Register-TelegramWebhook.ps1 -WorkerUrl https://YOUR_WORKER.w
 ```
 
 The last step securely prompts for the Bot Token and the same webhook secret, then registers `/webhook`, `/start`, and the Telegram menu. Use an HTTPS root URL without a path, credentials, query, or fragment; register the webhook again if the URL changes. Keep production secrets in Cloudflare. Never commit `.dev.vars`, `wrangler.jsonc`, database exports, or logs.
+
+The registration script accepts `-ConfigPath` for deployment settings and `-SecureWebhookSecret` as a SecureString within the same PowerShell process. Never pass a plaintext secret as a command-line argument. Without these options, the default config and secure prompts are unchanged.
 
 ### Usage and verification
 

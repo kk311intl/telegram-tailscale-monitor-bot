@@ -445,27 +445,28 @@ async function deliverNotification(notification, env) {
   try {
     const payload = JSON.parse(notification.payload);
     await sendStatusNotification(payload, env, syncLease);
-    await env.STATUS_DB.prepare(`
-      UPDATE notification_outbox SET sent_at = ?, last_error = '', lease_token = '', lease_until = 0
-      WHERE id = ? AND sent_at = 0 AND lease_token = ?
-    `).bind(nowSeconds(), notification.id, leaseToken).run();
+    await markDeliverySent(env.STATUS_DB, 'notification_outbox', notification.id, leaseToken);
   } catch (error) {
-    const plan = notificationFailurePlan(error, notification.attempts, nowSeconds());
-    if (plan.terminal) {
-      await env.STATUS_DB.prepare(`
-        UPDATE notification_outbox SET attempts = ?, failed_at = ?, last_error = ?, lease_token = '', lease_until = 0
-        WHERE id = ? AND sent_at = 0 AND lease_token = ?
-      `).bind(plan.attempts, nowSeconds(), safeError(error), notification.id, leaseToken).run();
-    } else {
-      await env.STATUS_DB.prepare(`
-        UPDATE notification_outbox SET attempts = ?, next_attempt_at = ?, last_error = ?, lease_token = '', lease_until = 0
-        WHERE id = ? AND sent_at = 0 AND lease_token = ?
-      `).bind(plan.attempts, plan.nextAttemptAt, safeError(error), notification.id, leaseToken).run();
-    }
+    await recordDeliveryFailure(env.STATUS_DB, 'notification_outbox', notification, leaseToken, error);
     console.error("Status notification failed", safeError(error));
   }
   return true;
   } finally { await releaseLease(env.STATUS_DB, 'sync', syncLease); }
+}
+
+// Table names are fixed by the two delivery callers, never taken from a payload.
+async function markDeliverySent(db, table, id, leaseToken) {
+  await db.prepare(`UPDATE ${table} SET sent_at = ?, last_error = '', lease_token = '', lease_until = 0
+    WHERE id = ? AND sent_at = 0 AND lease_token = ?`).bind(nowSeconds(), id, leaseToken).run();
+}
+
+async function recordDeliveryFailure(db, table, notification, leaseToken, error) {
+  const plan = notificationFailurePlan(error, notification.attempts, nowSeconds());
+  const field = plan.terminal ? 'failed_at' : 'next_attempt_at';
+  const timestamp = plan.terminal ? nowSeconds() : plan.nextAttemptAt;
+  await db.prepare(`UPDATE ${table} SET attempts = ?, ${field} = ?, last_error = ?, lease_token = '', lease_until = 0
+    WHERE id = ? AND sent_at = 0 AND lease_token = ?`
+  ).bind(plan.attempts, timestamp, safeError(error), notification.id, leaseToken).run();
 }
 
 async function sendStatusNotification(payload, env, visibilityLease) {
@@ -572,19 +573,9 @@ async function deliverAuxiliaryAlert(alert, env) {
         return;
       }
       await sendAuxiliaryAlert(alert.kind, payload, env, syncLease);
-      await env.STATUS_DB.prepare(`UPDATE auxiliary_alerts SET sent_at = ?, last_error = '', lease_token = '', lease_until = 0
-        WHERE id = ? AND sent_at = 0 AND lease_token = ?`).bind(nowSeconds(), alert.id, leaseToken).run();
+      await markDeliverySent(env.STATUS_DB, 'auxiliary_alerts', alert.id, leaseToken);
     } catch (error) {
-      const plan = notificationFailurePlan(error, alert.attempts, nowSeconds());
-      if (plan.terminal) {
-        await env.STATUS_DB.prepare(`UPDATE auxiliary_alerts SET attempts = ?, failed_at = ?, last_error = ?, lease_token = '', lease_until = 0
-          WHERE id = ? AND sent_at = 0 AND lease_token = ?`
-        ).bind(plan.attempts, nowSeconds(), safeError(error), alert.id, leaseToken).run();
-      } else {
-        await env.STATUS_DB.prepare(`UPDATE auxiliary_alerts SET attempts = ?, next_attempt_at = ?, last_error = ?, lease_token = '', lease_until = 0
-          WHERE id = ? AND sent_at = 0 AND lease_token = ?`
-        ).bind(plan.attempts, plan.nextAttemptAt, safeError(error), alert.id, leaseToken).run();
-      }
+      await recordDeliveryFailure(env.STATUS_DB, 'auxiliary_alerts', alert, leaseToken, error);
       console.error("Auxiliary alert failed", safeError(error));
     }
   } finally {
@@ -646,10 +637,7 @@ async function refreshDashboard(env, page = 0) {
 
 async function dashboardView(env, warning = "", requestedPage = 0) {
   if (!(await visibilityFresh(env))) return unavailableView(env);
-  const query = await env.STATUS_DB.prepare(`
-    SELECT * FROM servers WHERE ports = 'tailscale' AND enabled = 1
-  `).all();
-  const devices = (query.results || []).sort(compareDeviceRows);
+  const devices = await visibleDeviceRows(env);
   const pages = Math.max(1, Math.ceil(devices.length / LIST_PAGE_SIZE));
   const page = clampInteger(requestedPage, 0, pages - 1, 0);
   const lines = devices.length
@@ -691,18 +679,25 @@ function compareDeviceRows(left, right) {
   return byAddress || String(left.name).localeCompare(String(right.name), "zh-Hant");
 }
 
+async function visibleDeviceRows(env) {
+  const query = await env.STATUS_DB.prepare("SELECT * FROM servers WHERE ports = 'tailscale' AND enabled = 1").all();
+  return (query.results || []).sort(compareDeviceRows);
+}
+
+function pageNavigation(env, page, pages, action) {
+  const buttons = [];
+  if (page > 0) buttons.push({ text: t(env.BOT_LANGUAGE, "previous"), callback_data: `${action}:${page - 1}` });
+  buttons.push({ text: `${page + 1}/${pages}`, callback_data: `${action}:${page}` });
+  if (page + 1 < pages) buttons.push({ text: t(env.BOT_LANGUAGE, "next"), callback_data: `${action}:${page + 1}` });
+  return buttons;
+}
+
 function mainKeyboard(env, page = 0, pages = 1) {
   const buttons = [[
     { text: `📋 ${t(env.BOT_LANGUAGE, "deviceList")}`, callback_data: "list:0" },
     { text: `🔄 ${t(env.BOT_LANGUAGE, "refresh")}`, callback_data: `home:${page}` }
   ]];
-  if (pages > 1) {
-    const navigation = [];
-    if (page > 0) navigation.push({ text: t(env.BOT_LANGUAGE, "previous"), callback_data: `page:${page - 1}` });
-    navigation.push({ text: `${page + 1}/${pages}`, callback_data: `page:${page}` });
-    if (page + 1 < pages) navigation.push({ text: t(env.BOT_LANGUAGE, "next"), callback_data: `page:${page + 1}` });
-    buttons.push(navigation);
-  }
+  if (pages > 1) buttons.push(pageNavigation(env, page, pages, 'page'));
   return { inline_keyboard: buttons };
 }
 
@@ -716,10 +711,7 @@ async function editDeviceList(chatId, messageId, env, page) {
 
 async function deviceListView(env, requestedPage) {
   if (!(await visibilityFresh(env))) return unavailableView(env);
-  const query = await env.STATUS_DB.prepare(`
-    SELECT * FROM servers WHERE ports = 'tailscale' AND enabled = 1
-  `).all();
-  const allRows = (query.results || []).sort(compareDeviceRows);
+  const allRows = await visibleDeviceRows(env);
   const total = allRows.length;
   const pages = Math.max(1, Math.ceil(total / LIST_PAGE_SIZE));
   const page = Math.min(pages - 1, clampInteger(requestedPage, 0, Number.MAX_SAFE_INTEGER, 0));
@@ -728,11 +720,7 @@ async function deviceListView(env, requestedPage) {
     text: `${statusIcon(row.status)} ${truncate(deviceLabel(row.name, parseDevice(row.last_results), env), 33)}`,
     callback_data: `detail:${row.id}:${page}`
   }]);
-  const navigation = [];
-  if (page > 0) navigation.push({ text: t(env.BOT_LANGUAGE, "previous"), callback_data: `list:${page - 1}` });
-  navigation.push({ text: `${page + 1}/${pages}`, callback_data: `list:${page}` });
-  if (page + 1 < pages) navigation.push({ text: t(env.BOT_LANGUAGE, "next"), callback_data: `list:${page + 1}` });
-  buttons.push(navigation);
+  buttons.push(pageNavigation(env, page, pages, 'list'));
   buttons.push([{ text: t(env.BOT_LANGUAGE, "backOverview"), callback_data: "home" }]);
   return {
     text: `<b>${t(env.BOT_LANGUAGE, "deviceList")}</b>\n${t(env.BOT_LANGUAGE, "listSummary", total)}`,
