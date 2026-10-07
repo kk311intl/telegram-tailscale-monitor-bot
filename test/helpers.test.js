@@ -59,7 +59,7 @@ test("repeated notification timestamps reuse Intl while keeping DST and invalid-
   assert.equal(constructors, 1);
   assert.equal(formatLocalTime(0, "Invalid/Repeated"), "1970-01-01 00:00:00 UTC+0");
   assert.equal(formatLocalTime(1, "Invalid/Repeated"), "1970-01-01 00:00:01 UTC+0");
-  assert.equal(constructors, 2);
+  assert.equal(constructors, 3);
 });
 
 test("all deployment languages have matching UI messages and invalid values fall back to Chinese", () => {

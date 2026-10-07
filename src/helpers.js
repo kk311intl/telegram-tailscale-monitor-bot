@@ -5,9 +5,7 @@ const timeFormatOptions = {
   hour: "2-digit", minute: "2-digit", second: "2-digit",
   hourCycle: "h23", timeZoneName: "shortOffset"
 };
-// Initialize ICU during module startup, outside the CPU-limited scheduled work.
-const utcFormatter = new Intl.DateTimeFormat("en-CA", { ...timeFormatOptions, timeZone: "UTC" });
-let timeFormatter = { timeZone: "UTC", value: utcFormatter };
+let timeFormatter = { timeZone: "", value: null };
 
 export function clampInteger(value, minimum, maximum, fallback) {
   if (value === undefined || value === null || value === "") return fallback;
@@ -31,13 +29,13 @@ export function formatAge(timestamp, current = Math.floor(Date.now() / 1000), la
 }
 
 export function formatLocalTime(timestamp, timeZone = "UTC") {
-  if (timeFormatter.timeZone !== timeZone) {
+  if (timeFormatter.timeZone !== timeZone || !timeFormatter.value) {
     let value;
     try {
       value = new Intl.DateTimeFormat("en-CA", { ...timeFormatOptions, timeZone });
     } catch (error) {
       if (!(error instanceof RangeError)) throw error;
-      value = utcFormatter;
+      value = new Intl.DateTimeFormat("en-CA", { ...timeFormatOptions, timeZone: "UTC" });
     }
     timeFormatter = { timeZone, value };
   }
