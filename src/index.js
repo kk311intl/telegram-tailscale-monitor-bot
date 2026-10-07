@@ -11,7 +11,7 @@ import {
   notificationFailurePlan
 } from "./helpers.js";
 import { claimUpdate, completeUpdate, releaseUpdate } from "./update-lifecycle.js";
-import { acquireLease, releaseLease, readState, checkCooldown, setCooldown, retrySeconds, requestJson } from "./api-runtime.js";
+import { acquireLease, releaseLease, readState, checkCooldown, setCooldown, retrySeconds, requestJson, readBoundedText } from "./api-runtime.js";
 import { t } from "./i18n.js";
 
 const TELEGRAM_API = "https://api.telegram.org";
@@ -36,7 +36,7 @@ export default {
     if (request.method !== "POST" || url.pathname !== "/webhook") {
       return new Response("Not found", { status: 404 });
     }
-    if (!env.BOT_TOKEN || !env.WEBHOOK_SECRET || !env.ADMIN_USER_ID) {
+    if (!env.BOT_TOKEN || !env.WEBHOOK_SECRET || !/^[1-9]\d*$/.test(String(env.ADMIN_USER_ID || "")) || !Number.isSafeInteger(Number(env.ADMIN_USER_ID))) {
       return new Response("Service configuration error", { status: 503 });
     }
     const supplied = request.headers.get("X-Telegram-Bot-Api-Secret-Token") || "";
@@ -47,15 +47,15 @@ export default {
     if (declared > MAX_BODY_BYTES) return new Response("Payload too large", { status: 413 });
     let update;
     try {
-      const body = await request.text();
-      if (new TextEncoder().encode(body).byteLength > MAX_BODY_BYTES) {
-        return new Response("Payload too large", { status: 413 });
-      }
+      const body = await readBoundedText(request.body, MAX_BODY_BYTES, request.signal);
       update = JSON.parse(body);
-    } catch {
+    } catch (error) {
+      if (error instanceof RangeError && error.message === "Body size limit exceeded") return new Response("Payload too large", { status: 413 });
       return new Response("Bad request", { status: 400 });
     }
-    if (!update || !Number.isSafeInteger(update.update_id)) return new Response("Bad request", { status: 400 });
+    if (!update || !Number.isSafeInteger(update.update_id) || update.update_id < 0) return new Response("Bad request", { status: 400 });
+    const sender = (update.callback_query || update.message)?.from;
+    if (!sender || !Number.isSafeInteger(sender.id) || sender.id < 1 || sender.is_bot || String(sender.id) !== String(env.ADMIN_USER_ID)) return json({ ok: true });
     const updateContext = await claimUpdate(env.STATUS_DB, update.update_id);
     if (updateContext.state === "done") return json({ ok: true, duplicate: true });
     if (updateContext.state === "busy") {
@@ -67,6 +67,11 @@ export default {
       return json({ ok: true });
     } catch (error) {
       console.error("Update processing failed", safeError(error));
+      const code = Number(error.telegramErrorCode || 0);
+      if (code >= 400 && code < 500 && code !== 429) {
+        await completeUpdate(env.STATUS_DB, updateContext);
+        return json({ ok: true });
+      }
       await releaseUpdate(env.STATUS_DB, updateContext, error);
       return json({ ok: false, retry: true }, { status: 500 });
     }
@@ -103,7 +108,7 @@ export async function processUpdate(update, env) {
 }
 
 async function processMessage(message, env) {
-  if (!message?.from || message.from.is_bot) return;
+  if (!message?.from || message.from.is_bot || !Number.isSafeInteger(message.chat?.id) || message.chat.id === 0) return;
   if (String(message.from.id) !== String(env.ADMIN_USER_ID)) return;
   if (message.chat?.type !== "private") {
     await telegram(env, "sendMessage", { chat_id: message.chat.id, text: t(env.BOT_LANGUAGE, "privateOnly") });
@@ -130,9 +135,10 @@ async function processMessage(message, env) {
 }
 
 async function processCallback(query, env) {
+  if (typeof query?.id !== "string" || !query.id) return;
   const privateOwnerChat = query?.message?.chat?.type === "private" &&
     String(query.message.chat.id) === String(env.ADMIN_USER_ID);
-  if (!query?.from || String(query.from.id) !== String(env.ADMIN_USER_ID) || !privateOwnerChat) {
+  if (!query?.from || query.from.is_bot || String(query.from.id) !== String(env.ADMIN_USER_ID) || !privateOwnerChat) {
     if (query?.id) await telegram(env, "answerCallbackQuery", { callback_query_id: query.id, text: t(env.BOT_LANGUAGE, "unauthorized"), show_alert: true });
     return;
   }
@@ -189,9 +195,12 @@ export async function fetchTailscaleDevices(env, fetchImpl = fetch) {
   const { response, data } = await tailscaleJson(env, fetchImpl, `${TAILSCALE_API}/tailnet/${tailnet}/devices?fields=all`, {
     headers: { authorization: `Bearer ${token}`, accept: "application/json" }
   }, "Tailscale Devices API");
+  if (response.status === 401) oauthCache = { clientId: "", token: "", expiresAt: 0 };
   if (!response.ok) throw new Error(`Tailscale Devices API: HTTP ${response.status}`);
   if (!Array.isArray(data?.devices)) throw new Error("Tailscale Devices API: 回應格式無效");
-  return data.devices.map(normalizeTailscaleDevice);
+  const devices = data.devices.map(normalizeTailscaleDevice);
+  if (new Set(devices.map(device => device.id)).size !== devices.length) throw new Error("Tailscale Devices API: 設備 ID 重複");
+  return devices;
 }
 
 async function getTailscaleAccessToken(env, fetchImpl) {
@@ -276,10 +285,16 @@ export async function syncTailscaleDevices(env, notify) {
   statements.push(env.STATUS_DB.prepare(`UPDATE notification_outbox SET failed_at = ?, last_error = 'device hidden'
     WHERE sent_at = 0 AND failed_at = 0 AND server_id IN (SELECT id FROM servers WHERE ports = 'tailscale' AND enabled = 0)
     AND ${fence}`).bind(checkedAt, lease));
+  // A lost fence violates NOT NULL, aborting the whole batch instead of committing a partial snapshot.
   statements.push(env.STATUS_DB.prepare(`INSERT INTO runtime_state(key, until_at)
-    SELECT 'visibility', ? WHERE ${fence}
-    ON CONFLICT(key) DO UPDATE SET until_at = excluded.until_at`).bind(checkedAt + 120, lease));
-  const results = await env.STATUS_DB.batch(statements);
+    VALUES ('visibility', CASE WHEN ${fence} THEN ? ELSE NULL END)
+    ON CONFLICT(key) DO UPDATE SET until_at = excluded.until_at`).bind(lease, checkedAt + 120));
+  let results;
+  try { results = await env.STATUS_DB.batch(statements); }
+  catch (error) {
+    if (/NOT NULL constraint failed: runtime_state\.until_at/i.test(String(error.message))) throw new Error('同步已逾時，未套用設備資料');
+    throw error;
+  }
   if (Number(results.at(-1)?.meta?.changes) !== 1) throw new Error('同步已逾時，未套用設備資料');
   await env.STATUS_DB.prepare("UPDATE runtime_state SET failures = 0, until_at = 0 WHERE key = 'tailscale'").run();
   return devices.length;
@@ -390,26 +405,35 @@ function persistTailscaleDevice(device, checkedAt, syncToken, env, notify, exist
 
 async function drainNotificationOutbox(env, limit) {
   if (!env.BOT_TOKEN || !env.ADMIN_USER_ID) return;
-  if (!(await visibilityFresh(env))) return;
-  const due = await env.STATUS_DB.prepare(`
+  let remaining = limit;
+  while (remaining > 0) {
+    if (!(await visibilityFresh(env))) return;
+    const due = await env.STATUS_DB.prepare(`
     SELECT n.* FROM notification_outbox n
     JOIN servers s ON s.id = n.server_id
     WHERE s.ports = 'tailscale' AND s.enabled = 1 AND n.sent_at = 0 AND n.failed_at = 0
       AND n.next_attempt_at <= ? AND n.lease_until <= ?
+      AND NOT EXISTS (SELECT 1 FROM notification_outbox earlier
+        WHERE earlier.server_id = n.server_id AND earlier.id < n.id
+          AND earlier.sent_at = 0 AND earlier.failed_at = 0)
     ORDER BY n.next_attempt_at ASC, n.id ASC LIMIT ?
-  `).bind(nowSeconds(), nowSeconds(), limit).all();
-  for (const notification of due.results || []) {
-    if (!(await visibilityFresh(env))) break;
-    if ((await readState(env.STATUS_DB, 'telegram')).until_at > nowSeconds()) break;
-    await deliverNotification(notification, env);
+    `).bind(nowSeconds(), nowSeconds(), remaining).all();
+    let processed = false;
+    for (const notification of due.results || []) {
+      if (!(await visibilityFresh(env))) return;
+      if ((await readState(env.STATUS_DB, 'telegram')).until_at > nowSeconds()) return;
+      processed = await deliverNotification(notification, env) || processed;
+      remaining--;
+    }
+    if (!processed) return;
   }
 }
 
 async function deliverNotification(notification, env) {
   const syncLease = await acquireLease(env.STATUS_DB, 'sync', 30);
-  if (!syncLease) return;
+  if (!syncLease) return false;
   try {
-  if (!(await visibilityFresh(env))) return;
+  if (!(await visibilityFresh(env))) return false;
   const leaseToken = crypto.randomUUID();
   const claimed = await env.STATUS_DB.prepare(`
     UPDATE notification_outbox SET lease_token = ?, lease_until = ?
@@ -417,10 +441,10 @@ async function deliverNotification(notification, env) {
       AND server_id IN (SELECT id FROM servers WHERE ports = 'tailscale' AND enabled = 1)
       AND EXISTS (SELECT 1 FROM runtime_state WHERE key = 'sync' AND token = ? AND until_at > unixepoch())
   `).bind(leaseToken, nowSeconds() + 60, notification.id, nowSeconds(), nowSeconds(), syncLease).run();
-  if (Number(claimed.meta?.changes || 0) !== 1) return;
+  if (Number(claimed.meta?.changes || 0) !== 1) return false;
   try {
     const payload = JSON.parse(notification.payload);
-    await sendStatusNotification(payload, env);
+    await sendStatusNotification(payload, env, syncLease);
     await env.STATUS_DB.prepare(`
       UPDATE notification_outbox SET sent_at = ?, last_error = '', lease_token = '', lease_until = 0
       WHERE id = ? AND sent_at = 0 AND lease_token = ?
@@ -440,10 +464,17 @@ async function deliverNotification(notification, env) {
     }
     console.error("Status notification failed", safeError(error));
   }
+  return true;
   } finally { await releaseLease(env.STATUS_DB, 'sync', syncLease); }
 }
 
-async function sendStatusNotification(payload, env) {
+async function sendStatusNotification(payload, env, visibilityLease) {
+  if (!payload || !Number.isSafeInteger(payload.id) || payload.id < 1 || typeof payload.name !== "string" ||
+      !payload.device || typeof payload.device !== "object" || Array.isArray(payload.device) ||
+      !["down", "recovered"].includes(payload.event) || !Number.isSafeInteger(payload.eventTime) ||
+      payload.eventTime < 0 || !Number.isFinite(new Date(payload.eventTime * 1000).getTime())) {
+    throw new SyntaxError("Invalid status notification payload");
+  }
   const offline = payload.event === "down";
   const label = deviceLabel(payload.name, payload.device, env);
   await telegram(env, "sendMessage", {
@@ -457,7 +488,7 @@ async function sendStatusNotification(payload, env) {
     ].join("\n"),
     parse_mode: "HTML",
     reply_markup: { inline_keyboard: [[{ text: t(env.BOT_LANGUAGE, "viewDetails"), callback_data: `detail:${payload.id}:0` }]] }
-  });
+  }, visibilityLease);
 }
 
 async function updateSyncHealth(env) {
@@ -514,6 +545,8 @@ async function deliverAuxiliaryAlert(alert, env) {
   const health = alert.kind === 'sync_lost' || alert.kind === 'sync_restored';
   const healthLease = health ? await acquireLease(env.STATUS_DB, 'monitor-health-lock', 120) : '';
   if (health && !healthLease) return;
+  const syncLease = health ? '' : await acquireLease(env.STATUS_DB, 'sync', 30);
+  if (!health && !syncLease) return;
   try {
     const leaseToken = crypto.randomUUID();
     const now = nowSeconds();
@@ -523,6 +556,10 @@ async function deliverAuxiliaryAlert(alert, env) {
     if (Number(claimed.meta?.changes || 0) !== 1) return;
     try {
       const payload = JSON.parse(alert.payload);
+      if (!payload || typeof payload !== 'object' || Array.isArray(payload) ||
+          (!health && (typeof payload.deviceId !== 'string' || !payload.deviceId || typeof payload.name !== 'string'))) {
+        throw new SyntaxError('Invalid auxiliary alert payload');
+      }
       const validity = await auxiliaryAlertValidity(alert, payload, env);
       if (validity === 'wait') {
         await env.STATUS_DB.prepare(`UPDATE auxiliary_alerts SET lease_token = '', lease_until = 0, next_attempt_at = ?
@@ -534,7 +571,7 @@ async function deliverAuxiliaryAlert(alert, env) {
           WHERE id = ? AND lease_token = ?`).bind(nowSeconds(), alert.id, leaseToken).run();
         return;
       }
-      await sendAuxiliaryAlert(alert.kind, payload, env);
+      await sendAuxiliaryAlert(alert.kind, payload, env, syncLease);
       await env.STATUS_DB.prepare(`UPDATE auxiliary_alerts SET sent_at = ?, last_error = '', lease_token = '', lease_until = 0
         WHERE id = ? AND sent_at = 0 AND lease_token = ?`).bind(nowSeconds(), alert.id, leaseToken).run();
     } catch (error) {
@@ -552,6 +589,7 @@ async function deliverAuxiliaryAlert(alert, env) {
     }
   } finally {
     if (healthLease) await releaseLease(env.STATUS_DB, 'monitor-health-lock', healthLease);
+    if (syncLease) await releaseLease(env.STATUS_DB, 'sync', syncLease);
   }
 }
 
@@ -577,7 +615,7 @@ async function auxiliaryAlertValidity(alert, payload, env) {
   return 'cancel';
 }
 
-async function sendAuxiliaryAlert(kind, payload, env) {
+async function sendAuxiliaryAlert(kind, payload, env, visibilityLease) {
   const lang = env.BOT_LANGUAGE;
   const name = escapeHtml(payload.name || '');
   const messages = {
@@ -587,7 +625,7 @@ async function sendAuxiliaryAlert(kind, payload, env) {
     device_removed: `⚪ <b>${t(lang, 'deviceRemovedTitle')}</b>\n<b>${name}</b>`,
     key_expiring: `⚠️ <b>${t(lang, 'keyExpiringTitle')}</b>\n<b>${name}</b>\n${t(lang, 'keyExpires')}${t(lang, 'colon')}${formatTailscaleTime(payload.expires, env.TIME_ZONE, lang)}`
   };
-  await telegram(env, 'sendMessage', { chat_id: env.ADMIN_USER_ID, text: messages[kind], parse_mode: 'HTML' });
+  await telegram(env, 'sendMessage', { chat_id: env.ADMIN_USER_ID, text: messages[kind], parse_mode: 'HTML' }, visibilityLease);
 }
 
 async function syncWarning(env) {
@@ -684,7 +722,7 @@ async function deviceListView(env, requestedPage) {
   const allRows = (query.results || []).sort(compareDeviceRows);
   const total = allRows.length;
   const pages = Math.max(1, Math.ceil(total / LIST_PAGE_SIZE));
-  const page = Math.max(0, Math.min(pages - 1, Number(requestedPage || 0)));
+  const page = Math.min(pages - 1, clampInteger(requestedPage, 0, Number.MAX_SAFE_INTEGER, 0));
   const rows = allRows.slice(page * LIST_PAGE_SIZE, (page + 1) * LIST_PAGE_SIZE);
   const buttons = rows.map((row) => [{
     text: `${statusIcon(row.status)} ${truncate(deviceLabel(row.name, parseDevice(row.last_results), env), 33)}`,
@@ -712,6 +750,7 @@ async function editDeviceDetail(chatId, messageId, env, id, page = 0, warning = 
 }
 
 async function deviceDetailView(env, id, page, warning = "") {
+  page = clampInteger(page, 0, Number.MAX_SAFE_INTEGER, 0);
   if (!(await visibilityFresh(env))) return unavailableView(env);
   const row = await getDeviceRow(env, id);
   if (!row) return { text: t(env.BOT_LANGUAGE, "removed"), reply_markup: mainKeyboard(env) };
@@ -762,12 +801,22 @@ async function editOrSend(chatId, messageId, view, env) {
   return telegram(env, "sendMessage", { chat_id: chatId, ...view });
 }
 
-async function telegram(env, method, payload) {
+async function telegram(env, method, payload, visibilityLease = '') {
   await checkCooldown(env.STATUS_DB, 'telegram');
   const lease = await acquireLease(env.STATUS_DB, 'telegram-send', 30);
   if (!lease) throw Object.assign(new Error('Telegram 發送中，請稍後重試'), { telegramErrorCode: 429, retryAfter: 1 });
   try {
     await checkCooldown(env.STATUS_DB, 'telegram');
+    const renewed = await env.STATUS_DB.prepare(`UPDATE runtime_state SET until_at = unixepoch() + 30
+      WHERE ((key = 'telegram-send' AND token = ?) OR (? != '' AND key = 'sync' AND token = ?))
+        AND EXISTS (SELECT 1 FROM runtime_state WHERE key = 'telegram-send' AND token = ? AND until_at > unixepoch())
+        AND (? = '' OR (EXISTS (SELECT 1 FROM runtime_state WHERE key = 'sync' AND token = ? AND until_at > unixepoch())
+          AND EXISTS (SELECT 1 FROM runtime_state WHERE key = 'visibility' AND until_at > unixepoch())))
+        AND NOT EXISTS (SELECT 1 FROM runtime_state WHERE key = 'telegram' AND until_at > unixepoch())`
+    ).bind(lease, visibilityLease, visibilityLease, lease, visibilityLease, visibilityLease).run();
+    if (Number(renewed.meta?.changes || 0) !== (visibilityLease ? 2 : 1)) {
+      throw Object.assign(new Error('Telegram or notification visibility lease expired'), { telegramErrorCode: 429, retryAfter: 1 });
+    }
     const { response, data } = await requestJson(fetch, `${TELEGRAM_API}/bot${env.BOT_TOKEN}/${method}`, {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -816,7 +865,7 @@ function parseCommand(text) {
 
 function statusIcon(status) { return status === "up" ? "🟢" : status === "down" ? "🔴" : "⚪"; }
 function statusLabel(status, lang) { return t(lang, status === "up" ? "online" : status === "down" ? "offline" : "pending"); }
-function truncate(value, length) { const text = String(value || ""); return text.length > length ? `${text.slice(0, length - 1)}…` : text; }
+function truncate(value, length) { const characters = Array.from(String(value || "")); return characters.length > length ? `${characters.slice(0, length - 1).join("")}…` : characters.join(""); }
 function nowSeconds() { return Math.floor(Date.now() / 1000); }
 function safeError(error) { return String(error?.message || error || "未知錯誤").replace(/[\r\n]+/g, " ").slice(0, 300); }
 function json(value, init = {}) {

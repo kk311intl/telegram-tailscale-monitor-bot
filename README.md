@@ -2,7 +2,7 @@
 
 [中文](#zh-tw) · [日本語](#ja) · [English](#en)
 
-版本 / バージョン / Version：`v1.4.2`
+版本 / バージョン / Version：`v1.4.3`
 
 
 <a id="zh-tw"></a>
@@ -53,7 +53,7 @@ pnpm exec wrangler deploy --config wrangler.jsonc
 pwsh -File ./tools/Register-TelegramWebhook.ps1 -WorkerUrl https://YOUR_WORKER.workers.dev
 ```
 
-最後一步會隱藏輸入 Bot Token 與同一個 Webhook Secret，向 Telegram 註冊 `/webhook`、`/start` 命令及選單。用實際 Worker 網址取代範例；正式網址變更後需重新註冊 Webhook。正式 Secret 應保存在 Cloudflare，不要提交 `.dev.vars`、`wrangler.jsonc`、資料庫匯出或日誌。
+最後一步會隱藏輸入 Bot Token 與同一個 Webhook Secret，向 Telegram 註冊 `/webhook`、`/start` 命令及選單。使用 HTTPS 根網址，不帶路徑、帳密、查詢或片段；正式網址變更後需重新註冊 Webhook。正式 Secret 應保存在 Cloudflare，不要提交 `.dev.vars`、`wrangler.jsonc`、資料庫匯出或日誌。
 
 ### 使用與驗證
 
@@ -64,6 +64,10 @@ Telegram 私聊 `/start` 顯示最近的有效快照；`/status` 同步並顯示
 Cron 每分鐘喚起私有 `SCHEDULER` SQLite Durable Object 執行同步與通知，避開免費 Cron 的 10 ms CPU 上限；設備與通知資料仍存 D1。首次部署時 Wrangler 自動套用範例中的 `scheduler-v1` migration；從舊版升級須把範例的 `durable_objects` 和 `migrations` 一併加入自己的設定。SQLite Durable Objects 支援免費方案，實際用量受 [Cloudflare 配額](https://developers.cloudflare.com/durable-objects/platform/pricing/) 限制。
 
 同步完成後優先發送離線／恢復通知，再處理輔助提醒與清理；時間格式器會重用。排程中斷、API 故障或 Telegram 限流仍可能延遲通知。遇到延遲時，對照 D1 `notification_outbox` 的 `created_at`／`sent_at` 與 Worker 日誌；「最後在線」不是通知建立時間。
+
+同一設備的離線／恢復通知依建立順序送出，重試不會讓恢復通知越過離線通知；同步逾時會完整回滾，設備提醒發送前會重新驗證鎖定與快照。Tailscale／Telegram 的 429 會保存共用退避；Devices API 的 401 會清除快取 token。Webhook 限制 256 KiB，API 回應限制 10 MiB，含回應本文的 API 逾時為 10 秒，禁止自動轉址。非管理者更新不存 D1；Telegram 永久 4xx（429 除外）不重試。
+
+GeoIP 國旗只是端點 IP 的推斷：Devices API 的端點清單無法證明哪個介面目前活躍，不保證設備的實際所在地。Telegram 已收件但回應或 D1 確認遺失時，重試仍可能造成重複通知。
 
 ```powershell
 Invoke-RestMethod https://YOUR_WORKER.workers.dev/health
@@ -119,7 +123,7 @@ pnpm exec wrangler deploy --config wrangler.jsonc
 pwsh -File ./tools/Register-TelegramWebhook.ps1 -WorkerUrl https://YOUR_WORKER.workers.dev
 ```
 
-最後の手順では Bot Token と同じ Webhook Secret を非表示で入力し、`/webhook`、`/start`、Telegram メニューを登録します。URL を実際の Worker URL に置き換えてください。URL を変えた場合は再登録が必要です。運用用の Secret は Cloudflare に保存し、`.dev.vars`、`wrangler.jsonc`、データベースのエクスポートやログをコミットしないでください。
+最後の手順では Bot Token と同じ Webhook Secret を非表示で入力し、`/webhook`、`/start`、Telegram メニューを登録します。HTTPS のルート URL を指定し、パス・認証情報・クエリ・フラグメントは付けないでください。URL を変えた場合は再登録が必要です。運用用の Secret は Cloudflare に保存し、`.dev.vars`、`wrangler.jsonc`、データベースのエクスポートやログをコミットしないでください。
 
 ### 使い方と確認
 
@@ -130,6 +134,10 @@ Telegram の個人チャットで `/start` は有効な最新スナップショ�
 Cron は毎分、非公開の SQLite Durable Object `SCHEDULER` に同期と通知を渡し、無料 Cron の 10 ms CPU 制限を避けます。端末と通知のデータは引き続き D1 に保存します。初回 deploy で Wrangler が例の `scheduler-v1` migration を適用します。旧版からの更新では、例の `durable_objects` と `migrations` を自分の設定にも追加してください。SQLite Durable Objects は無料プランでも利用でき、[Cloudflare の利用枠](https://developers.cloudflare.com/durable-objects/platform/pricing/) が適用されます。
 
 同期後はオフライン／復旧通知を優先し、補助通知とクリーンアップを後で処理します。日時フォーマッターを再利用します。スケジュールの中断、API 障害、Telegram のレート制限で通知が遅れる場合は、D1 の `notification_outbox` の `created_at`／`sent_at` と Worker ログを確認してください。最終オンライン時刻は通知の作成時刻ではありません。
+
+同じ端末のオフライン／復旧通知は作成順に配信し、再試行中のオフライン通知を復旧通知が追い越しません。同期の期限切れでは変更全体をロールバックし、端末通知の送信直前にロックとスナップショットを再確認します。429 は共有バックオフ、Devices API の 401 は token キャッシュ削除で処理します。Webhook は 256 KiB、API 応答は 10 MiB、本文を含む API タイムアウトは 10 秒で、自動リダイレクトは禁止します。管理者以外の更新は D1 に保存せず、Telegram の恒久的な 4xx（429 以外）は再試行しません。
+
+GeoIP の国旗はエンドポイント IP からの推定です。Devices API の一覧では現在有効なインターフェースを判別できず、端末の実際の所在地は保証できません。Telegram が受信済みでも応答や D1 の記録が失われると、再試行で通知が重複する可能性があります。
 
 ```powershell
 Invoke-RestMethod https://YOUR_WORKER.workers.dev/health
@@ -185,7 +193,7 @@ pnpm exec wrangler deploy --config wrangler.jsonc
 pwsh -File ./tools/Register-TelegramWebhook.ps1 -WorkerUrl https://YOUR_WORKER.workers.dev
 ```
 
-The last step securely prompts for the Bot Token and the same webhook secret, then registers `/webhook`, `/start`, and the Telegram menu. Replace the example with your actual Worker URL; register the webhook again if the URL changes. Keep production secrets in Cloudflare. Never commit `.dev.vars`, `wrangler.jsonc`, database exports, or logs.
+The last step securely prompts for the Bot Token and the same webhook secret, then registers `/webhook`, `/start`, and the Telegram menu. Use an HTTPS root URL without a path, credentials, query, or fragment; register the webhook again if the URL changes. Keep production secrets in Cloudflare. Never commit `.dev.vars`, `wrangler.jsonc`, database exports, or logs.
 
 ### Usage and verification
 
@@ -196,6 +204,10 @@ The bot also alerts when valid device snapshots stop for at least five minutes a
 Cron invokes the private SQLite Durable Object `SCHEDULER` each minute to run sync and notifications outside the free Cron's 10 ms CPU limit. Device and notification data remain in D1. Wrangler applies the example's `scheduler-v1` migration on first deployment. When upgrading an older configuration, copy both `durable_objects` and `migrations` from the example into your config. SQLite Durable Objects support the free plan and are subject to [Cloudflare quotas](https://developers.cloudflare.com/durable-objects/platform/pricing/).
 
 After syncing, offline/recovery notifications run before auxiliary alerts and cleanup. Date formatters are reused. Interrupted schedules, API outages, or Telegram rate limits can still delay delivery. Compare `created_at`/`sent_at` in D1's `notification_outbox` with Worker logs when investigating delays; the last-online timestamp is not the notification creation time.
+
+Offline/recovery notifications for each device are delivered in creation order; recovery cannot overtake an offline retry. Expired syncs roll back all changes, and device alerts recheck their lock and snapshot immediately before sending. A shared backoff handles 429; a Devices API 401 clears the token cache. Webhooks are capped at 256 KiB, API responses at 10 MiB, and API deadlines at 10 seconds including the body; automatic redirects are disabled. Non-admin updates are not stored in D1. Permanent Telegram 4xx errors, except 429, are not retried.
+
+GeoIP flags are endpoint-IP estimates: the Devices API endpoint list cannot identify the currently active interface or guarantee the device's physical location. If Telegram accepts a message but its response or the D1 acknowledgement is lost, a retry can still duplicate the notification.
 
 ```powershell
 Invoke-RestMethod https://YOUR_WORKER.workers.dev/health

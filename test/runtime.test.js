@@ -2,14 +2,14 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync, readdirSync } from 'node:fs';
 import { DatabaseSync } from 'node:sqlite';
-import { requestJson, retrySeconds } from '../src/api-runtime.js';
+import { requestJson, retrySeconds, readBoundedText } from '../src/api-runtime.js';
 import { normalizeTailscaleDevice, hasHiddenTag, extractPublicEndpoint } from '../src/helpers.js';
 
 let source = readFileSync(new URL('../src/index.js', import.meta.url), 'utf8');
 for (const file of ['helpers.js', 'i18n.js', 'update-lifecycle.js', 'api-runtime.js']) {
   source = source.replace(JSON.stringify('./' + file), JSON.stringify(new URL('../src/' + file, import.meta.url).href));
 }
-source += '\nexport {editOrSend, enrichDeviceCountries, dashboardView, deviceListView, deviceDetailView, drainNotificationOutbox, sendStatusNotification, updateSyncHealth, drainAuxiliaryAlerts};';
+source += '\nexport {editOrSend, enrichDeviceCountries, dashboardView, deviceListView, deviceDetailView, drainNotificationOutbox, sendStatusNotification, updateSyncHealth, drainAuxiliaryAlerts, truncate};';
 const app = await import('data:text/javascript;base64,' + Buffer.from(source).toString('base64'));
 const now = () => Math.floor(Date.now() / 1000);
 const response = (data, status = 200, headers = {}) => new Response(JSON.stringify(data), { status, headers });
@@ -52,6 +52,205 @@ test('concurrent sync cannot hide valid devices', async t => {
   assert.equal(db.prepare('SELECT enabled FROM servers').get().enabled, 1);
   await app.syncTailscaleDevices(env, false);
   assert.equal(db.prepare('SELECT enabled FROM servers').get().enabled, 1);
+});
+
+test('duplicate API device IDs reject the entire snapshot without changing saved devices', async t => {
+  const { db, env, devices } = setup(t);
+  await app.syncTailscaleDevices(env, false);
+  devices.push({ ...devices[0], connectedToControl: false });
+  await assert.rejects(app.syncTailscaleDevices(env, true), /重複/);
+  assert.equal(db.prepare('SELECT status FROM servers').get().status, 'up');
+});
+
+test('invalid list pages cannot produce broken Telegram callback data', async t => {
+  const { env, devices } = setup(t);
+  devices.push(...Array.from({ length: 20 }, (_, i) => ({ id: 'page-' + i, name: 'page-' + i, connectedToControl: true })));
+  await app.syncTailscaleDevices(env, false);
+  for (const page of ['NaN', '1.5', Infinity, -1]) {
+    const view = await app.deviceListView(env, page);
+    assert.ok(view.reply_markup.inline_keyboard.length > 2);
+    for (const button of view.reply_markup.inline_keyboard.flat()) assert.doesNotMatch(button.callback_data, /NaN|Infinity|1\.5|:-1/);
+  }
+});
+
+test('a recovering device cannot overtake its earlier offline notification retry', async t => {
+  const { db, env } = setup(t);
+  await app.syncTailscaleDevices(env, false);
+  for (const [token, event, due] of [['older', 'down', now() + 120], ['later', 'recovered', 0]]) {
+    db.prepare('INSERT INTO notification_outbox(server_id,check_token,event,payload,next_attempt_at,created_at) VALUES (1,?,?,?,?,?)')
+      .run(token, event, JSON.stringify({ id: 1, name: 'node', device: {}, event, eventTime: now() }), due, now());
+  }
+  let sends = 0;
+  globalThis.fetch = async () => { sends++; return response({ ok: true }); };
+  await app.drainNotificationOutbox(env, 5);
+  assert.equal(sends, 0);
+  db.exec("UPDATE notification_outbox SET next_attempt_at=0 WHERE check_token='older'");
+  await app.drainNotificationOutbox(env, 5);
+  await app.drainNotificationOutbox(env, 5);
+  assert.equal(sends, 2);
+});
+
+test('auxiliary device alerts hold the visibility lock during external delivery', async t => {
+  const { db, env, devices } = setup(t);
+  env.HIDDEN_TAGS = 'tag:personal';
+  await app.syncTailscaleDevices(env, true);
+  devices.push({ id: 'n2', name: 'private-later.example.ts.net', connectedToControl: true });
+  await app.syncTailscaleDevices(env, true);
+  const originalFetch = globalThis.fetch;
+  let concurrentSync;
+  globalThis.fetch = async (url, init) => {
+    if (String(url).includes('api.telegram.org')) {
+      devices[1].tags = ['tag:personal'];
+      [concurrentSync] = await Promise.allSettled([app.syncTailscaleDevices(env, true)]);
+      return response({ ok: true });
+    }
+    return originalFetch(url, init);
+  };
+  await app.drainAuxiliaryAlerts(env, 5);
+  assert.equal(concurrentSync.status, 'rejected');
+  assert.equal(db.prepare("SELECT enabled FROM servers WHERE host='n2'").get().enabled, 1);
+  await app.syncTailscaleDevices(env, true);
+  assert.equal(db.prepare("SELECT enabled FROM servers WHERE host='n2'").get().enabled, 0);
+});
+
+test('losing the visibility lock while claiming Telegram send prevents outgoing notification', async t => {
+  const { db, env } = setup(t);
+  await app.syncTailscaleDevices(env, false);
+  db.prepare("INSERT INTO notification_outbox(server_id,check_token,event,payload,created_at) VALUES (1,'late-fence','down',?,1)").run(JSON.stringify({ id: 1, name: 'node', device: {}, event: 'down', eventTime: 1 }));
+  const prepare = env.STATUS_DB.prepare;
+  env.STATUS_DB.prepare = sql => {
+    const statement = prepare(sql);
+    if (sql.includes('INSERT INTO runtime_state(key, token, until_at)')) {
+      const run = statement.run;
+      statement.run = async () => {
+        const result = await run.call(statement);
+        if (statement.values[0] === 'telegram-send') db.prepare("UPDATE runtime_state SET token='replacement' WHERE key='sync'").run();
+        return result;
+      };
+    }
+    return statement;
+  };
+  let sends = 0;
+  globalThis.fetch = async () => { sends++; return response({ ok: true }); };
+  await app.drainNotificationOutbox(env, 5);
+  assert.equal(sends, 0);
+});
+
+test('an unauthorized webhook update is acknowledged without database or external API work', async t => {
+  const { db, env, calls } = setup(t);
+  env.WEBHOOK_SECRET = 'secret';
+  const req = new Request('https://test.invalid/webhook', { method: 'POST', headers: { 'X-Telegram-Bot-Api-Secret-Token': 'secret' }, body: JSON.stringify({ update_id: 900, message: { from: { id: 2 }, chat: { id: 2, type: 'private' }, text: '/status' } }) });
+  assert.equal((await app.default.fetch(req, env)).status, 200);
+  assert.equal(calls.length, 0);
+  assert.equal(db.prepare('SELECT count(*) AS n FROM processed_updates WHERE update_id=900').get().n, 0);
+});
+
+test('expiry midway through a sync rolls back earlier device writes and visibility', async t => {
+  const { db, env, devices } = setup(t);
+  await app.syncTailscaleDevices(env, false);
+  const previous = db.prepare('SELECT * FROM servers').get();
+  const visibility = db.prepare("SELECT until_at FROM runtime_state WHERE key='visibility'").get().until_at;
+  db.exec(`CREATE TRIGGER expire_sync AFTER UPDATE ON servers BEGIN
+    UPDATE runtime_state SET until_at=0 WHERE key='sync'; END`);
+  devices[0].name = 'changed.example.ts.net';
+  await assert.rejects(app.syncTailscaleDevices(env, false), /同步已逾時/);
+  assert.deepEqual(db.prepare('SELECT * FROM servers').get(), previous);
+  assert.equal(db.prepare("SELECT until_at FROM runtime_state WHERE key='visibility'").get().until_at, visibility);
+});
+
+test('invalid queued payload is terminal and cannot block the next device notification', async t => {
+  const { db, env } = setup(t);
+  await app.syncTailscaleDevices(env, false);
+  for (const [token, payload] of [['bad', '{}'], ['valid', JSON.stringify({ id: 1, name: 'node', device: {}, event: 'recovered', eventTime: now() })]]) {
+    db.prepare("INSERT INTO notification_outbox(server_id,check_token,event,payload,created_at) VALUES (1,?,'recovered',?,1)").run(token, payload);
+  }
+  let sends = 0;
+  globalThis.fetch = async () => { sends++; return response({ ok: true }); };
+  await app.drainNotificationOutbox(env, 5);
+  assert.equal(sends, 1);
+  assert.ok(db.prepare("SELECT failed_at FROM notification_outbox WHERE check_token='bad'").get().failed_at > 0);
+  assert.ok(db.prepare("SELECT sent_at FROM notification_outbox WHERE check_token='valid'").get().sent_at > 0);
+});
+
+test('a revoked cached OAuth token is discarded for the next synchronization', async t => {
+  const { env, devices } = setup(t);
+  let oauthRequests = 0;
+  let rejectToken = false;
+  globalThis.fetch = async url => {
+    if (String(url).endsWith('/oauth/token')) { oauthRequests++; return response({ access_token: 'token-' + oauthRequests, expires_in: 3600 }); }
+    return rejectToken ? response({}, 401) : response({ devices });
+  };
+  await app.fetchTailscaleDevices(env);
+  rejectToken = true;
+  await assert.rejects(app.fetchTailscaleDevices(env), /HTTP 401/);
+  rejectToken = false;
+  await app.fetchTailscaleDevices(env);
+  assert.equal(oauthRequests, 2);
+});
+
+test('webhook byte limit cancels oversized streaming bodies before database work', async t => {
+  const { env, calls } = setup(t);
+  env.WEBHOOK_SECRET = 'secret';
+  let cancelled = false;
+  const body = new ReadableStream({ start(controller) { controller.enqueue(new Uint8Array(256 * 1024 + 1)); }, cancel() { cancelled = true; } });
+  const req = new Request('https://test.invalid/webhook', { method: 'POST', headers: { 'X-Telegram-Bot-Api-Secret-Token': 'secret' }, body, duplex: 'half' });
+  assert.equal((await app.default.fetch(req, env)).status, 413);
+  assert.equal(cancelled, true);
+  assert.equal(calls.length, 0);
+});
+
+test('bounded readers preserve split UTF-8 and enforce bytes rather than characters', async () => {
+  const bytes = new TextEncoder().encode('中文🟢');
+  const stream = () => new ReadableStream({ start(controller) { for (const byte of bytes) controller.enqueue(Uint8Array.of(byte)); controller.close(); } });
+  assert.equal(await readBoundedText(stream(), bytes.length), '中文🟢');
+  await assert.rejects(readBoundedText(stream(), 3), /Body size limit/);
+  assert.equal(app.truncate('🟢🟢🟢', 2), '🟢…');
+});
+
+test('a reader started after abort still cancels the upstream body', async () => {
+  const controller = new AbortController();
+  controller.abort();
+  let cancelled = false;
+  const stream = new ReadableStream({ cancel() { cancelled = true; } });
+  await assert.rejects(readBoundedText(stream, 100, controller.signal), { name: 'AbortError' });
+  assert.equal(cancelled, true);
+});
+
+test('malformed owner messages and invalid admin configuration cannot trigger API calls', async t => {
+  const { env, calls } = setup(t);
+  await app.processUpdate({ message: { from: { id: 1 }, text: '/start' } }, env);
+  await app.processUpdate({ callback_query: { from: { id: 1 }, message: { chat: { id: 1, type: 'private' } }, data: 'home' } }, env);
+  env.WEBHOOK_SECRET = 'secret';
+  env.ADMIN_USER_ID = '01';
+  assert.equal((await app.default.fetch(new Request('https://test.invalid/webhook', { method: 'POST', body: '{}' }), env)).status, 503);
+  assert.equal(calls.length, 0);
+});
+
+test('API response size and deadline cancel body streams; authenticated calls never follow redirects', async () => {
+  let cancelled = false;
+  const large = new ReadableStream({ start(controller) { controller.enqueue(new Uint8Array(10 * 1024 * 1024 + 1)); }, cancel() { cancelled = true; } });
+  await assert.rejects(requestJson(async (url, init) => {
+    assert.equal(init.redirect, 'error');
+    return new Response(large);
+  }, 'https://test.invalid', {}, 'test'), /回應過大/);
+  assert.equal(cancelled, true);
+  cancelled = false;
+  const stalled = new ReadableStream({ cancel() { cancelled = true; } });
+  await assert.rejects(requestJson(async () => new Response(stalled), 'https://test.invalid', {}, 'test', 15), /請求逾時/);
+  assert.equal(cancelled, true);
+});
+
+test('permanent Telegram rejection is acknowledged, but transient webhook errors remain retryable', async t => {
+  const { db, env } = setup(t);
+  env.WEBHOOK_SECRET = 'secret';
+  let errorCode = 403;
+  globalThis.fetch = async () => response({ ok: false, error_code: errorCode, description: 'rejected', parameters: { retry_after: 5 } }, errorCode);
+  const request = id => new Request('https://test.invalid/webhook', { method: 'POST', headers: { 'X-Telegram-Bot-Api-Secret-Token': 'secret' }, body: JSON.stringify({ update_id: id, message: { from: { id: 1 }, chat: { id: 1, type: 'private' }, text: '/help' } }) });
+  assert.equal((await app.default.fetch(request(910), env)).status, 200);
+  assert.equal(db.prepare('SELECT status FROM processed_updates WHERE update_id=910').get().status, 'done');
+  errorCode = 429;
+  assert.equal((await app.default.fetch(request(911), env)).status, 500);
+  assert.equal(db.prepare('SELECT status FROM processed_updates WHERE update_id=911').get().status, 'failed');
 });
 
 test('Cron delegates to its private scheduler and surfaces failed execution', async t => {

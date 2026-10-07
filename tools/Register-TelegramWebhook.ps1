@@ -2,11 +2,17 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)]
-    [ValidatePattern('^https://')]
+    [ValidateScript({
+        $uri = $null
+        [Uri]::TryCreate($_, [UriKind]::Absolute, [ref]$uri) -and
+        $uri.Scheme -eq 'https' -and $uri.Host -and -not $uri.UserInfo -and
+        -not $uri.Query -and -not $uri.Fragment -and $uri.AbsolutePath -eq '/'
+    }, ErrorMessage = 'WorkerUrl must be an HTTPS root URL without credentials, path, query or fragment.')]
     [string]$WorkerUrl
 )
 
 $ErrorActionPreference = 'Stop'
+$WorkerUrl = ([Uri]$WorkerUrl).GetLeftPart([UriPartial]::Authority)
 $projectRoot = Split-Path -Parent $PSScriptRoot
 $configPath = Join-Path $projectRoot 'wrangler.jsonc'
 $botLanguage = if (Test-Path -LiteralPath $configPath) { (Get-Content -Raw -LiteralPath $configPath | ConvertFrom-Json).vars.BOT_LANGUAGE } else { 'zh' }

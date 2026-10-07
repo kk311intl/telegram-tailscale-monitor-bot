@@ -1,4 +1,31 @@
 export const nowSeconds = () => Math.floor(Date.now() / 1000);
+const MAX_JSON_RESPONSE_BYTES = 10 * 1024 * 1024;
+
+export async function readBoundedText(stream, maximum, signal) {
+  if (!stream) return "";
+  const reader = stream.getReader();
+  const cancel = () => { reader.cancel().catch(() => {}); };
+  signal?.addEventListener("abort", cancel, { once: true });
+  if (signal?.aborted) cancel();
+  const decoder = new TextDecoder();
+  let bytes = 0;
+  let text = "";
+  try {
+    while (true) {
+      if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
+      const chunk = await reader.read();
+      if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
+      if (chunk.done) break;
+      bytes += chunk.value.byteLength;
+      if (bytes > maximum) { cancel(); throw new RangeError("Body size limit exceeded"); }
+      text += decoder.decode(chunk.value, { stream: true });
+    }
+    return text + decoder.decode();
+  } finally {
+    signal?.removeEventListener("abort", cancel);
+    reader.releaseLock();
+  }
+}
 
 export async function readState(db, key) {
   return await db.prepare('SELECT * FROM runtime_state WHERE key = ?').bind(key).first() || {};
@@ -55,8 +82,14 @@ export async function requestJson(fetchImpl, url, init, label, timeoutMs = 10000
   try {
     return await Promise.race([
       (async () => {
-        const response = await fetchImpl(url, { ...init, signal: controller.signal });
-        const data = await response.json().catch(() => null);
+        const response = await fetchImpl(url, { ...init, redirect: "error", signal: controller.signal });
+        let data;
+        if (response.body) {
+          const text = await readBoundedText(response.body, MAX_JSON_RESPONSE_BYTES, controller.signal);
+          try { data = JSON.parse(text); } catch { data = null; }
+        } else {
+          data = await response.json().catch(() => null);
+        }
         return { response, data };
       })(),
       new Promise((_, reject) => {
@@ -64,7 +97,8 @@ export async function requestJson(fetchImpl, url, init, label, timeoutMs = 10000
       })
     ]);
   } catch (error) {
-    if (error?.message === `${label}: 請求逾時`) throw error;
+    if (controller.signal.aborted) throw new Error(`${label}: 請求逾時`);
+    if (error instanceof RangeError && error.message === "Body size limit exceeded") throw new Error(`${label}: 回應過大`);
     throw new Error(`${label}: 連線或回應格式錯誤`);
   } finally { clearTimeout(timer); }
 }

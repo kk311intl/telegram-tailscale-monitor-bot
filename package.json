@@ -1,6 +1,6 @@
 {
   "name": "tailscale-server-monitor",
-  "version": "1.4.2",
+  "version": "1.4.3",
   "license": "GPL-3.0-only",
   "private": true,
   "type": "module",
@@ -12,6 +12,6 @@
     "db:remote": "wrangler d1 migrations apply STATUS_DB --remote --config wrangler.jsonc"
   },
   "devDependencies": {
-    "wrangler": "^4.35.0"
+    "wrangler": "^4.148.0"
   }
 }
