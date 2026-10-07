@@ -2,7 +2,7 @@
 
 [中文](#zh-tw) · [日本語](#ja) · [English](#en)
 
-版本 / バージョン / Version：`v1.4.0`
+版本 / バージョン / Version：`v1.4.1`
 
 
 <a id="zh-tw"></a>
@@ -60,6 +60,8 @@ pwsh -File ./tools/Register-TelegramWebhook.ps1 -WorkerUrl https://YOUR_WORKER.w
 Telegram 私聊 `/start` 顯示最近的有效快照；`/status` 同步並顯示總覽，`/list` 顯示設備，`/device ID` 顯示詳情。總覽和設備列表每頁顯示 10 台，可用按鈕翻頁。只有 `ADMIN_USER_ID` 可操作。Worker 每分鐘同步；連續兩次有效離線觀察、且至少相隔 60 秒，才確認離線。短暫 API 故障不會把設備判成離線；符合 `HIDDEN_TAGS` 的設備會隱藏。
 
 此外，Bot 會在有效設備快照中斷至少 5 分鐘及恢復時通知，並通知可見設備首次加入或從 API 清單消失。若 API 提供設備金鑰到期時間，會在到期前 7 天內提醒一次；金鑰更新後可再次提醒。首次建立設備清單不發新增通知。這些通知依賴 Worker 排程、D1 與 Telegram，不能在 Worker 本身停止運作時即時告警。
+
+同步完成後優先發送離線／恢復通知，再處理輔助提醒與清理；時間格式器會重用以降低排程 CPU 開銷。排程中斷、API 故障或 Telegram 限流仍可能延遲通知。遇到延遲時，對照 D1 `notification_outbox` 的 `created_at`／`sent_at` 與 Worker 日誌；「最後在線」不是通知建立時間。
 
 ```powershell
 Invoke-RestMethod https://YOUR_WORKER.workers.dev/health
@@ -123,6 +125,8 @@ Telegram の個人チャットで `/start` は有効な最新スナップショ�
 
 有効な端末スナップショットが 5 分以上途絶えた場合と復旧時、表示対象の端末が API の一覧に追加・削除された場合にも通知します。API にキーの有効期限がある端末は、期限前 7 日以内に一度通知し、キー更新後は再通知できます。初回の端末一覧作成では追加通知を送りません。これらの通知は Worker のスケジュール、D1、Telegram に依存するため、Worker 自体が停止した場合の即時警報にはなりません。
 
+同期後はオフライン／復旧通知を優先し、補助通知とクリーンアップを後で処理します。日時フォーマッターを再利用して定期処理の CPU 使用量を減らします。スケジュールの中断、API 障害、Telegram のレート制限で通知が遅れる場合は、D1 の `notification_outbox` の `created_at`／`sent_at` と Worker ログを確認してください。最終オンライン時刻は通知の作成時刻ではありません。
+
 ```powershell
 Invoke-RestMethod https://YOUR_WORKER.workers.dev/health
 ```
@@ -184,6 +188,8 @@ The last step securely prompts for the Bot Token and the same webhook secret, th
 In a private Telegram chat, `/start` shows the latest valid snapshot, `/status` syncs and shows the overview, `/list` shows devices, and `/device ID` shows details. The overview and device list show ten devices per page, with buttons to change pages. Only `ADMIN_USER_ID` can operate the bot. The Worker syncs each minute; it confirms offline status after two valid offline observations at least 60 seconds apart. Temporary API failures do not mark devices offline, and devices matching `HIDDEN_TAGS` are hidden.
 
 The bot also alerts when valid device snapshots stop for at least five minutes and when sync recovers, or when a visible device appears in or disappears from the API list. If the API supplies a device key expiry, it alerts once within seven days of expiry and can alert again after a key change. The initial inventory does not generate new-device alerts. These alerts depend on the Worker schedule, D1, and Telegram; they cannot provide an immediate warning if the Worker itself stops running.
+
+After syncing, offline/recovery notifications run before auxiliary alerts and cleanup. Date formatters are reused to reduce scheduled CPU usage. Interrupted schedules, API outages, or Telegram rate limits can still delay delivery. Compare `created_at`/`sent_at` in D1's `notification_outbox` with Worker logs when investigating delays; the last-online timestamp is not the notification creation time.
 
 ```powershell
 Invoke-RestMethod https://YOUR_WORKER.workers.dev/health

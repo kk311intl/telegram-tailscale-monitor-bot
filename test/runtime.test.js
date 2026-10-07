@@ -335,6 +335,59 @@ test('sync failure does not stop pending delivery with fresh visibility, stale v
   assert.ok(!view.text.includes('node'));
 });
 
+test('scheduled status delivery runs before auxiliary work', async t => {
+  const { db, env } = setup(t);
+  await app.syncTailscaleDevices(env, false);
+  db.prepare("INSERT INTO notification_outbox(server_id,check_token,event,payload,created_at) VALUES (1,'priority','down',?,1)").run(JSON.stringify({ id: 1, name: 'node', device: {}, event: 'down', eventTime: 1 }));
+  const prepare = env.STATUS_DB.prepare;
+  let deliveredBeforeAuxiliary = false;
+  env.STATUS_DB.prepare = sql => {
+    if (sql.includes("INSERT OR IGNORE INTO runtime_state") && sql.includes("monitor-health")) {
+      deliveredBeforeAuxiliary = db.prepare("SELECT sent_at FROM notification_outbox WHERE check_token='priority'").get().sent_at > 0;
+    }
+    return prepare(sql);
+  };
+  await app.runScheduledChecks({}, env);
+  assert.equal(deliveredBeforeAuxiliary, true);
+});
+
+test('an interrupted delivery cannot block the next minute of device sync', async t => {
+  const { db, env } = setup(t);
+  await app.syncTailscaleDevices(env, false);
+  db.prepare("INSERT INTO notification_outbox(server_id,check_token,event,payload,created_at) VALUES (1,'bounded-lock','down',?,1)").run(JSON.stringify({ id: 1, name: 'node', device: {}, event: 'down', eventTime: 1 }));
+  let remainingSyncLease = 0;
+  globalThis.fetch = async () => {
+    remainingSyncLease = db.prepare("SELECT until_at FROM runtime_state WHERE key='sync'").get().until_at - now();
+    return response({ ok: true, result: true });
+  };
+  await app.drainNotificationOutbox(env, 5);
+  assert.ok(remainingSyncLease >= 10 && remainingSyncLease < 60);
+});
+
+test('a replaced sync lease cannot claim or send a notification', async t => {
+  const { db, env } = setup(t);
+  await app.syncTailscaleDevices(env, false);
+  db.prepare("INSERT INTO notification_outbox(server_id,check_token,event,payload,created_at) VALUES (1,'fenced-delivery','down',?,1)").run(JSON.stringify({ id: 1, name: 'node', device: {}, event: 'down', eventTime: 1 }));
+  const prepare = env.STATUS_DB.prepare;
+  env.STATUS_DB.prepare = sql => {
+    const statement = prepare(sql);
+    if (sql.includes('UPDATE notification_outbox SET lease_token')) {
+      const run = statement.run;
+      statement.run = async () => {
+        db.prepare("UPDATE runtime_state SET token='replacement', until_at=? WHERE key='sync'").run(now() + 120);
+        return run.call(statement);
+      };
+    }
+    return statement;
+  };
+  let sends = 0;
+  globalThis.fetch = async () => { sends++; return response({ ok: true }); };
+  await app.drainNotificationOutbox(env, 5);
+  assert.equal(sends, 0);
+  assert.equal(db.prepare("SELECT lease_until FROM notification_outbox WHERE check_token='fenced-delivery'").get().lease_until, 0);
+  assert.equal(db.prepare("SELECT token FROM runtime_state WHERE key='sync'").get().token, 'replacement');
+});
+
 test('invalid webhook secret is rejected before database access', async t => {
   const { env, db } = setup(t);
   env.WEBHOOK_SECRET = 'secret';

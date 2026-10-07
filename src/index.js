@@ -138,13 +138,13 @@ async function processCallback(query, env) {
 
 export async function runScheduledChecks(event, env) {
   await syncWarning(env);
+  await drainNotificationOutbox(env, 5);
   try {
     await updateSyncHealth(env);
     await drainAuxiliaryAlerts(env, 5);
   } catch (error) {
     console.error("Auxiliary alert processing failed", safeError(error));
   }
-  await drainNotificationOutbox(env, 5);
   const scheduledSeconds = Math.floor(Number(event?.scheduledTime || Date.now()) / 1000);
   if (Math.floor(scheduledSeconds / 60) % 60 === 17) {
     await env.STATUS_DB.batch([
@@ -386,7 +386,7 @@ async function drainNotificationOutbox(env, limit) {
 }
 
 async function deliverNotification(notification, env) {
-  const syncLease = await acquireLease(env.STATUS_DB, 'sync', 120);
+  const syncLease = await acquireLease(env.STATUS_DB, 'sync', 30);
   if (!syncLease) return;
   try {
   if (!(await visibilityFresh(env))) return;
@@ -395,7 +395,8 @@ async function deliverNotification(notification, env) {
     UPDATE notification_outbox SET lease_token = ?, lease_until = ?
     WHERE id = ? AND sent_at = 0 AND failed_at = 0 AND next_attempt_at <= ? AND lease_until <= ?
       AND server_id IN (SELECT id FROM servers WHERE ports = 'tailscale' AND enabled = 1)
-  `).bind(leaseToken, nowSeconds() + 60, notification.id, nowSeconds(), nowSeconds()).run();
+      AND EXISTS (SELECT 1 FROM runtime_state WHERE key = 'sync' AND token = ? AND until_at > unixepoch())
+  `).bind(leaseToken, nowSeconds() + 60, notification.id, nowSeconds(), nowSeconds(), syncLease).run();
   if (Number(claimed.meta?.changes || 0) !== 1) return;
   try {
     const payload = JSON.parse(notification.payload);

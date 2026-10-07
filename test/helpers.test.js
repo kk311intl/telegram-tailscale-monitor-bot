@@ -47,6 +47,21 @@ test("notification timestamps use the configured time zone and current offset", 
   assert.equal(formatLocalTime(0, "Invalid/Zone"), "1970-01-01 00:00:00 UTC+0");
 });
 
+test("repeated notification timestamps reuse Intl while keeping DST and invalid-zone fallback", t => {
+  const Original = Intl.DateTimeFormat;
+  let constructors = 0;
+  t.mock.method(Intl, "DateTimeFormat", function (...args) {
+    constructors++;
+    return new Original(...args);
+  });
+  assert.equal(formatLocalTime(Date.parse("2026-01-01T12:00:00Z") / 1000, "Europe/Paris"), "2026-01-01 13:00:00 UTC+1");
+  assert.equal(formatLocalTime(Date.parse("2026-07-01T12:00:00Z") / 1000, "Europe/Paris"), "2026-07-01 14:00:00 UTC+2");
+  assert.equal(constructors, 1);
+  assert.equal(formatLocalTime(0, "Invalid/Repeated"), "1970-01-01 00:00:00 UTC+0");
+  assert.equal(formatLocalTime(1, "Invalid/Repeated"), "1970-01-01 00:00:01 UTC+0");
+  assert.equal(constructors, 2);
+});
+
 test("all deployment languages have matching UI messages and invalid values fall back to Chinese", () => {
   const keys = Object.keys(messages.zh).sort();
   for (const lang of ["ja", "en"]) assert.deepEqual(Object.keys(messages[lang]).sort(), keys);
@@ -104,6 +119,13 @@ test("public endpoint extraction excludes tailnet and private addresses", () => 
   ]), "8.8.8.8");
   assert.equal(extractPublicEndpoint(["[2606:4700:4700::1111]:41641"]), "2606:4700:4700::1111");
   assert.equal(extractPublicEndpoint(["10.0.0.1:41641"]), "");
+});
+
+test("endpoint parsing keeps IPv4 preference and stops once a public IPv4 is found", () => {
+  let unnecessaryReads = 0;
+  const trailing = { toString() { unnecessaryReads++; return "1.1.1.1:41641"; } };
+  assert.equal(extractPublicEndpoint(["[2606:4700:4700::1111]:41641", "10.0.0.1:41641", "8.8.8.8:41641", trailing]), "8.8.8.8");
+  assert.equal(unnecessaryReads, 0);
 });
 
 test("ISO country codes convert to flags safely", () => {

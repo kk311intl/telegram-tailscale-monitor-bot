@@ -1,5 +1,14 @@
 import { t } from "./i18n.js";
 
+const timeFormatOptions = {
+  year: "numeric", month: "2-digit", day: "2-digit",
+  hour: "2-digit", minute: "2-digit", second: "2-digit",
+  hourCycle: "h23", timeZoneName: "shortOffset"
+};
+// Initialize ICU during module startup, outside the CPU-limited scheduled work.
+const utcFormatter = new Intl.DateTimeFormat("en-CA", { ...timeFormatOptions, timeZone: "UTC" });
+let timeFormatter = { timeZone: "UTC", value: utcFormatter };
+
 export function clampInteger(value, minimum, maximum, fallback) {
   if (value === undefined || value === null || value === "") return fallback;
   const text = String(value).trim();
@@ -22,19 +31,17 @@ export function formatAge(timestamp, current = Math.floor(Date.now() / 1000), la
 }
 
 export function formatLocalTime(timestamp, timeZone = "UTC") {
-  const options = {
-    timeZone, year: "numeric", month: "2-digit", day: "2-digit",
-    hour: "2-digit", minute: "2-digit", second: "2-digit",
-    hourCycle: "h23", timeZoneName: "shortOffset"
-  };
-  let formatter;
-  try {
-    formatter = new Intl.DateTimeFormat("en-CA", options);
-  } catch (error) {
-    if (!(error instanceof RangeError)) throw error;
-    formatter = new Intl.DateTimeFormat("en-CA", { ...options, timeZone: "UTC" });
+  if (timeFormatter.timeZone !== timeZone) {
+    let value;
+    try {
+      value = new Intl.DateTimeFormat("en-CA", { ...timeFormatOptions, timeZone });
+    } catch (error) {
+      if (!(error instanceof RangeError)) throw error;
+      value = utcFormatter;
+    }
+    timeFormatter = { timeZone, value };
   }
-  const parts = Object.fromEntries(formatter.formatToParts(new Date(Number(timestamp) * 1000)).map(({ type, value }) => [type, value]));
+  const parts = Object.fromEntries(timeFormatter.value.formatToParts(new Date(Number(timestamp) * 1000)).map(({ type, value }) => [type, value]));
   return `${parts.year}-${parts.month}-${parts.day} ${parts.hour}:${parts.minute}:${parts.second} ${parts.timeZoneName.replace(/^GMT/, "UTC")}`;
 }
 
@@ -89,8 +96,14 @@ export function hasHiddenTag(device, hiddenTags) {
 
 export function extractPublicEndpoint(endpoints) {
   if (!Array.isArray(endpoints)) return "";
-  const candidates = endpoints.slice(0, 32).map(endpointHost).filter(isPublicIp);
-  return candidates.find((value) => ipv4Number(value) !== null) || candidates[0] || "";
+  let ipv6 = "";
+  for (let index = 0; index < Math.min(endpoints.length, 32); index++) {
+    const host = endpointHost(endpoints[index]);
+    if (!isPublicIp(host)) continue;
+    if (ipv4Number(host) !== null) return host;
+    if (!ipv6) ipv6 = host;
+  }
+  return ipv6;
 }
 
 function endpointHost(value) {
