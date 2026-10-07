@@ -2,7 +2,7 @@
 
 [中文](#zh-tw) · [日本語](#ja) · [English](#en)
 
-版本 / バージョン / Version：`v1.4.1`
+版本 / バージョン / Version：`v1.4.2`
 
 
 <a id="zh-tw"></a>

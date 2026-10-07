@@ -128,6 +128,15 @@ test("endpoint parsing keeps IPv4 preference and stops once a public IPv4 is fou
   assert.equal(unnecessaryReads, 0);
 });
 
+test("fast endpoint parsing preserves URL address and port validation", () => {
+  for (const endpoint of ["8.8.8.8:0", "8.8.8.8:65535", "8.8.8.8:00443", "008.008.008.008:443", "08.8.8.8:443"]) {
+    assert.equal(extractPublicEndpoint([endpoint]), new URL(`udp://${endpoint}`).hostname);
+  }
+  for (const endpoint of ["8.8.8.8:65536", "8.8.8.8:99999", "256.8.8.8:443", "010.010.010.010:443", "8.8.8.8:-1"]) {
+    assert.equal(extractPublicEndpoint([endpoint]), "");
+  }
+});
+
 test("ISO country codes convert to flags safely", () => {
   assert.equal(countryCodeToFlag("JP"), "🇯🇵");
   assert.equal(countryCodeToFlag("us"), "🇺🇸");
