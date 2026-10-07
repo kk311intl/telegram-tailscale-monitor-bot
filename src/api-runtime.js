@@ -82,7 +82,12 @@ export async function requestJson(fetchImpl, url, init, label, timeoutMs = 10000
   try {
     return await Promise.race([
       (async () => {
-        const response = await fetchImpl(url, { ...init, redirect: "error", signal: controller.signal });
+        const response = await fetchImpl(url, { ...init, redirect: "manual", signal: controller.signal });
+        // workerd does not implement redirect:error; never forward credentials to a redirect target.
+        if (response.status >= 300 && response.status < 400) {
+          response.body?.cancel().catch(() => {});
+          throw new Error("API redirect rejected");
+        }
         let data;
         if (response.body) {
           const text = await readBoundedText(response.body, MAX_JSON_RESPONSE_BYTES, controller.signal);

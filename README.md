@@ -28,6 +28,8 @@ README、AI 提示詞與 Bot 介面／通知皆支援中文、日文、英文；
 
 需要 Node.js 22.13+、pnpm 11+、Cloudflare Workers/D1/SQLite Durable Objects、Telegram Bot，以及只授予 `devices:core:read` 的 Tailscale OAuth Client。註冊 Webhook 的腳本需要 PowerShell 7。OAuth Client Secret 不是 Tailscale Auth key。
 
+`pnpm check` 包含 Node 邏輯測試與原生 Workers 的 API 讀取／轉址測試；後者使用 Wrangler 內附的 workerd 和模擬回應，不使用正式憑證。
+
 ```powershell
 pnpm install --frozen-lockfile
 Copy-Item wrangler.jsonc.example wrangler.jsonc
@@ -98,6 +100,8 @@ README、AI プロンプト、Bot の画面と通知は中国語・日本語・�
 
 Node.js 22.13+、pnpm 11+、Cloudflare Workers/D1/SQLite Durable Objects、Telegram Bot、`devices:core:read` のみを許可した Tailscale OAuth クライアントが必要です。Webhook 登録スクリプトには PowerShell 7 を使います。OAuth Client Secret は Tailscale の Auth key ではありません。
 
+`pnpm check` は Node のロジックテストと、Wrangler 同梱の workerd による API 読み取り・リダイレクトのネイティブテストを実行します。応答は模擬し、本番の認証情報は使いません。
+
 ```powershell
 pnpm install --frozen-lockfile
 Copy-Item wrangler.jsonc.example wrangler.jsonc
@@ -167,6 +171,8 @@ License: This project is licensed under [GNU GPL v3.0 only](LICENSE). Copyright 
 When `BOT_TITLE` is empty, the dashboard title follows `BOT_LANGUAGE`. The default time zone is UTC; set another IANA zone if needed.
 
 You need Node.js 22.13+, pnpm 11+, Cloudflare Workers/D1/SQLite Durable Objects, a Telegram bot, and a Tailscale OAuth client with only `devices:core:read`. The webhook registration script requires PowerShell 7. An OAuth client secret is not a Tailscale auth key.
+
+`pnpm check` includes Node logic tests and native Workers API-reader/redirect tests using Wrangler's bundled workerd, mocked responses, and no production credentials.
 
 ```powershell
 pnpm install --frozen-lockfile

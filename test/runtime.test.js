@@ -230,7 +230,7 @@ test('API response size and deadline cancel body streams; authenticated calls ne
   let cancelled = false;
   const large = new ReadableStream({ start(controller) { controller.enqueue(new Uint8Array(10 * 1024 * 1024 + 1)); }, cancel() { cancelled = true; } });
   await assert.rejects(requestJson(async (url, init) => {
-    assert.equal(init.redirect, 'error');
+    assert.equal(init.redirect, 'manual');
     return new Response(large);
   }, 'https://test.invalid', {}, 'test'), /回應過大/);
   assert.equal(cancelled, true);
