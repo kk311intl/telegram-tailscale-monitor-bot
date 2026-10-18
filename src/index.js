@@ -494,6 +494,12 @@ async function sendStatusNotification(payload, env, visibilityLease) {
 
 async function updateSyncHealth(env) {
   if (!env.BOT_TOKEN || !env.ADMIN_USER_ID) return;
+  const health = await env.STATUS_DB.prepare(`SELECT token, until_at,
+    (SELECT until_at FROM runtime_state WHERE key = 'visibility') AS visibility_until
+    FROM runtime_state WHERE key = 'monitor-health'`).first();
+  const lastSuccess = Math.max(0, Number(health?.visibility_until || 0) - 120);
+  if (health && !health.token && Number(health.until_at) === 0 &&
+      lastSuccess > 0 && nowSeconds() - lastSuccess < SYNC_ALERT_SECONDS) return;
   const lease = await acquireLease(env.STATUS_DB, 'monitor-health-lock', 120);
   if (!lease) return;
   try {

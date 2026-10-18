@@ -45,6 +45,26 @@ function setup(t) {
   return { db, env, devices, calls };
 }
 
+test('write reduction migration preserves devices and their unique identity', t => {
+  const db = new DatabaseSync(':memory:');
+  t.after(() => db.close());
+  const migration = '0008_reduce_writes.sql';
+  for (const file of readdirSync(new URL('../migrations/', import.meta.url)).sort().filter(file => file < migration)) {
+    db.exec(readFileSync(new URL('../migrations/' + file, import.meta.url), 'utf8'));
+  }
+  db.exec("INSERT INTO servers(name,host,ports,status,created_at,updated_at) VALUES('node','n1','tailscale','up',1,2)");
+  const saved = db.prepare('SELECT * FROM servers').all();
+  assert.ok(db.prepare("PRAGMA index_list('servers')").all().some(index => index.name === 'idx_servers_due'));
+  const sql = readFileSync(new URL('../migrations/' + migration, import.meta.url), 'utf8');
+  db.exec(sql);
+  db.exec(sql);
+  const indexes = db.prepare("PRAGMA index_list('servers')").all();
+  assert.equal(indexes.some(index => index.name === 'idx_servers_due'), false);
+  assert.ok(indexes.some(index => index.name === 'idx_servers_host_ports' && index.unique === 1));
+  assert.throws(() => db.exec("INSERT INTO servers(name,host,ports,created_at,updated_at) VALUES('duplicate','n1','tailscale',3,3)"), /UNIQUE constraint/);
+  assert.deepEqual(db.prepare('SELECT * FROM servers').all(), saved);
+});
+
 test('concurrent sync cannot hide valid devices', async t => {
   const { db, env } = setup(t);
   const results = await Promise.allSettled([app.syncTailscaleDevices(env, false), app.syncTailscaleDevices(env, false)]);
@@ -422,9 +442,36 @@ test('messages and callbacks reject other owners and non-owner chats', async t =
   assert.equal(calls.filter(url => url.includes('/devices?')).length, 0);
 });
 
+test('healthy sync initializes health state, then checks it without database writes', async t => {
+  const { db, env } = setup(t);
+  await app.syncTailscaleDevices(env, true);
+  assert.equal(db.prepare("SELECT token FROM runtime_state WHERE key = 'monitor-health'").get(), undefined);
+  await app.updateSyncHealth(env);
+  assert.deepEqual({ ...db.prepare("SELECT token, until_at FROM runtime_state WHERE key = 'monitor-health'").get() }, { token: '', until_at: 0 });
+  const changes = db.prepare('SELECT total_changes() AS n').get().n;
+  await app.updateSyncHealth(env);
+  await app.updateSyncHealth(env);
+  assert.equal(db.prepare('SELECT total_changes() AS n').get().n, changes);
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM auxiliary_alerts').get().n, 0);
+});
+
+test('health state without a successful sync retains its startup grace period', async t => {
+  const { db, env } = setup(t);
+  const startedAt = now();
+  await app.updateSyncHealth(env);
+  const state = db.prepare("SELECT token, until_at FROM runtime_state WHERE key = 'monitor-health'").get();
+  assert.equal(state.token, '');
+  assert.ok(state.until_at >= startedAt && state.until_at <= now());
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM auxiliary_alerts').get().n, 0);
+  db.prepare("UPDATE runtime_state SET until_at = ? WHERE key = 'monitor-health'").run(now() - 301);
+  await app.updateSyncHealth(env);
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM auxiliary_alerts WHERE kind = 'sync_lost'").get().n, 1);
+});
+
 test('stale sync alerts once and sends recovery only after an alert was delivered', async t => {
   const { db, env } = setup(t);
   await app.syncTailscaleDevices(env, true);
+  await app.updateSyncHealth(env);
   db.prepare("UPDATE runtime_state SET until_at = ? WHERE key = 'visibility'").run(now() - 181);
   await app.updateSyncHealth(env);
   assert.equal(db.prepare("SELECT COUNT(*) AS n FROM auxiliary_alerts WHERE kind = 'sync_lost'").get().n, 1);

@@ -96,6 +96,8 @@ Invoke-RestMethod https://YOUR_WORKER.workers.dev/health
 
 ### 升級
 
+升級時請套用全部 D1 遷移。`0008` 會移除已不再使用的設備到期索引，減少每分鐘寫入；設備資料與檢查頻率不變。
+
 備份資料，保留原有設定、資源 ID、Secrets 與遷移歷史，不重跑 `Copy-Item` 或 `d1 create`。對照[設定範例](wrangler.jsonc.example)補缺少的設定；舊設定若沒有 `durable_objects` 與 `migrations`，補上對應區塊，保留 `SCHEDULER` 與 `scheduler-v1`。
 
 ```powershell
@@ -212,6 +214,8 @@ Invoke-RestMethod https://YOUR_WORKER.workers.dev/health
 
 ### 更新
 
+更新時は D1 マイグレーションをすべて適用してください。`0008` は未使用の端末チェック期限インデックスを削除し、毎分の書き込みを減らします。端末データとチェック間隔は変わりません。
+
 データをバックアップし、設定、リソース ID、Secrets、マイグレーション履歴を保持します。`Copy-Item` と `d1 create` は再実行しません。[設定例](wrangler.jsonc.example)と比較し、不足する設定だけを追加します。古い設定に `durable_objects` と `migrations` がない場合は対応するブロックを補い、`SCHEDULER` と `scheduler-v1` を保持してください。
 
 ```powershell
@@ -326,6 +330,8 @@ Invoke-RestMethod https://YOUR_WORKER.workers.dev/health
 <a id="en-upgrade"></a>
 
 ### Upgrading
+
+Apply all D1 migrations when upgrading. `0008` removes the unused device due-time index to reduce writes per minute. Device data and the check interval are unchanged.
 
 Back up data and keep existing settings, resource IDs, secrets, and migration history. Do not rerun `Copy-Item` or `d1 create`. Compare the [config example](wrangler.jsonc.example) and add missing settings only. If an older config lacks `durable_objects` and `migrations`, add those blocks, retaining `SCHEDULER` and `scheduler-v1`.
 
