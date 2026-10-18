@@ -65,7 +65,6 @@ test("device rows hide API age and details hide observation counters", () => {
 test("Telegram UI hides the tailnet name and recovery uses the previous offline snapshot", () => {
   assert.doesNotMatch(source, /payload\.device\.name \|\| payload\.device\.id/);
   assert.doesNotMatch(source, /device\.name \|\| device\.id \|\| row\.host/);
-  assert.match(source, /observation\.event === "recovered" \? previousDevice\.lastSeen : device\.lastSeen/);
   const notification = source.slice(source.indexOf("async function sendStatusNotification"), source.indexOf("async function syncWarning"));
   assert.match(notification, /formatTailscaleTime\(payload\.device\.lastSeen, env\.TIME_ZONE, env\.BOT_LANGUAGE\)/);
   assert.doesNotMatch(notification, /previousLastSeen|offlineConfirmed/);

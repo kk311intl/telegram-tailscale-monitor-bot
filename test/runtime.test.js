@@ -9,7 +9,7 @@ let source = readFileSync(new URL('../src/index.js', import.meta.url), 'utf8');
 for (const file of ['helpers.js', 'i18n.js', 'update-lifecycle.js', 'api-runtime.js']) {
   source = source.replace(JSON.stringify('./' + file), JSON.stringify(new URL('../src/' + file, import.meta.url).href));
 }
-source += '\nexport {editOrSend, enrichDeviceCountries, dashboardView, deviceListView, deviceDetailView, drainNotificationOutbox, sendStatusNotification, updateSyncHealth, drainAuxiliaryAlerts, truncate, markDeliverySent, recordDeliveryFailure};';
+source += '\nexport {editOrSend, enrichDeviceCountries, dashboardView, deviceListView, deviceDetailView, drainNotificationOutbox, sendStatusNotification, truncate, markDeliverySent, recordDeliveryFailure};';
 const app = await import('data:text/javascript;base64,' + Buffer.from(source).toString('base64'));
 const now = () => Math.floor(Date.now() / 1000);
 const response = (data, status = 200, headers = {}) => new Response(JSON.stringify(data), { status, headers });
@@ -127,59 +127,34 @@ test('a recovering device cannot overtake its earlier offline notification retry
   assert.equal(sends, 2);
 });
 
-test('shared delivery writers preserve terminal/retry fields and fence both queues by lease', async t => {
+test('status delivery writers preserve terminal/retry fields and fence updates by lease', async t => {
   const { db, env } = setup(t);
   await app.syncTailscaleDevices(env, false);
   db.exec("INSERT INTO notification_outbox(server_id,check_token,event,payload,created_at) VALUES(1,'writer','down','{}',1)");
-  db.exec("INSERT INTO auxiliary_alerts(alert_key,kind,created_at) VALUES('writer','device_added',1)");
-  for (const table of ['notification_outbox', 'auxiliary_alerts']) {
-    db.exec(`UPDATE ${table} SET lease_token='owned',lease_until=100,next_attempt_at=123`);
-    await app.recordDeliveryFailure(env.STATUS_DB, table, { id: 1, attempts: 0 }, 'owned', new SyntaxError('invalid'));
-    let row = db.prepare(`SELECT * FROM ${table} WHERE id=1`).get();
-    assert.ok(row.failed_at > 0);
-    assert.equal(row.next_attempt_at, 123);
-    assert.equal(row.lease_token, '');
-    db.exec(`UPDATE ${table} SET failed_at=0,lease_token='owned',lease_until=100`);
-    const before = now();
-    await app.recordDeliveryFailure(env.STATUS_DB, table, { id: 1, attempts: 1 }, 'owned', { telegramErrorCode: 429, retryAfter: 5, message: 'limited' });
-    row = db.prepare(`SELECT * FROM ${table} WHERE id=1`).get();
-    assert.equal(row.failed_at, 0);
-    assert.equal(row.attempts, 2);
-    assert.ok(row.next_attempt_at >= before + 5 && row.next_attempt_at <= now() + 5);
-    const unchanged = { ...row };
-    await app.markDeliverySent(env.STATUS_DB, table, 1, 'lost');
-    await app.recordDeliveryFailure(env.STATUS_DB, table, row, 'lost', new SyntaxError('stale'));
-    assert.deepEqual({ ...db.prepare(`SELECT * FROM ${table} WHERE id=1`).get() }, unchanged);
-    db.exec(`UPDATE ${table} SET lease_token='owned',lease_until=100`);
-    await app.markDeliverySent(env.STATUS_DB, table, 1, 'owned');
-    row = db.prepare(`SELECT * FROM ${table} WHERE id=1`).get();
-    assert.ok(row.sent_at > 0);
-    assert.equal(row.lease_until, 0);
-    assert.equal(row.last_error, '');
-  }
-});
-
-test('auxiliary device alerts hold the visibility lock during external delivery', async t => {
-  const { db, env, devices } = setup(t);
-  env.HIDDEN_TAGS = 'tag:personal';
-  await app.syncTailscaleDevices(env, true);
-  devices.push({ id: 'n2', name: 'private-later.example.ts.net', connectedToControl: true });
-  await app.syncTailscaleDevices(env, true);
-  const originalFetch = globalThis.fetch;
-  let concurrentSync;
-  globalThis.fetch = async (url, init) => {
-    if (String(url).includes('api.telegram.org')) {
-      devices[1].tags = ['tag:personal'];
-      [concurrentSync] = await Promise.allSettled([app.syncTailscaleDevices(env, true)]);
-      return response({ ok: true });
-    }
-    return originalFetch(url, init);
-  };
-  await app.drainAuxiliaryAlerts(env, 5);
-  assert.equal(concurrentSync.status, 'rejected');
-  assert.equal(db.prepare("SELECT enabled FROM servers WHERE host='n2'").get().enabled, 1);
-  await app.syncTailscaleDevices(env, true);
-  assert.equal(db.prepare("SELECT enabled FROM servers WHERE host='n2'").get().enabled, 0);
+  const table = 'notification_outbox';
+  db.exec(`UPDATE ${table} SET lease_token='owned',lease_until=100,next_attempt_at=123`);
+  await app.recordDeliveryFailure(env.STATUS_DB, table, { id: 1, attempts: 0 }, 'owned', new SyntaxError('invalid'));
+  let row = db.prepare(`SELECT * FROM ${table} WHERE id=1`).get();
+  assert.ok(row.failed_at > 0);
+  assert.equal(row.next_attempt_at, 123);
+  assert.equal(row.lease_token, '');
+  db.exec(`UPDATE ${table} SET failed_at=0,lease_token='owned',lease_until=100`);
+  const before = now();
+  await app.recordDeliveryFailure(env.STATUS_DB, table, { id: 1, attempts: 1 }, 'owned', { telegramErrorCode: 429, retryAfter: 5, message: 'limited' });
+  row = db.prepare(`SELECT * FROM ${table} WHERE id=1`).get();
+  assert.equal(row.failed_at, 0);
+  assert.equal(row.attempts, 2);
+  assert.ok(row.next_attempt_at >= before + 5 && row.next_attempt_at <= now() + 5);
+  const unchanged = { ...row };
+  await app.markDeliverySent(env.STATUS_DB, table, 1, 'lost');
+  await app.recordDeliveryFailure(env.STATUS_DB, table, row, 'lost', new SyntaxError('stale'));
+  assert.deepEqual({ ...db.prepare(`SELECT * FROM ${table} WHERE id=1`).get() }, unchanged);
+  db.exec(`UPDATE ${table} SET lease_token='owned',lease_until=100`);
+  await app.markDeliverySent(env.STATUS_DB, table, 1, 'owned');
+  row = db.prepare(`SELECT * FROM ${table} WHERE id=1`).get();
+  assert.ok(row.sent_at > 0);
+  assert.equal(row.lease_until, 0);
+  assert.equal(row.last_error, '');
 });
 
 test('losing the visibility lock while claiming Telegram send prevents outgoing notification', async t => {
@@ -216,15 +191,19 @@ test('an unauthorized webhook update is acknowledged without database or externa
 
 test('expiry midway through a sync rolls back earlier device writes and visibility', async t => {
   const { db, env, devices } = setup(t);
+  let clock = Date.now();
+  t.mock.method(Date, 'now', () => clock);
   await app.syncTailscaleDevices(env, false);
   const previous = db.prepare('SELECT * FROM servers').get();
-  const visibility = db.prepare("SELECT until_at FROM runtime_state WHERE key='visibility'").get().until_at;
+  const visibility = db.prepare("SELECT token,until_at FROM runtime_state WHERE key='visibility'").get();
   db.exec(`CREATE TRIGGER expire_sync AFTER UPDATE ON servers BEGIN
     UPDATE runtime_state SET until_at=0 WHERE key='sync'; END`);
   devices[0].name = 'changed.example.ts.net';
+  devices[0].lastSeen = '2026-09-01T01:02:03Z';
+  clock += 60000;
   await assert.rejects(app.syncTailscaleDevices(env, false), /同步已逾時/);
   assert.deepEqual(db.prepare('SELECT * FROM servers').get(), previous);
-  assert.equal(db.prepare("SELECT until_at FROM runtime_state WHERE key='visibility'").get().until_at, visibility);
+  assert.deepEqual(db.prepare("SELECT token,until_at FROM runtime_state WHERE key='visibility'").get(), visibility);
 });
 
 test('invalid queued payload is terminal and cannot block the next device notification', async t => {
@@ -442,115 +421,175 @@ test('messages and callbacks reject other owners and non-owner chats', async t =
   assert.equal(calls.filter(url => url.includes('/devices?')).length, 0);
 });
 
-test('healthy sync initializes health state, then checks it without database writes', async t => {
-  const { db, env } = setup(t);
+test('unchanged devices keep their stored rows while every minute refreshes visibility with three writes', async t => {
+  const { db, env, devices } = setup(t);
+  let clock = Date.now();
+  t.mock.method(Date, 'now', () => clock);
+  devices.push(...Array.from({ length: 8 }, (_, index) => ({ id: `stable-${index}`, name: `stable-${index}`, connectedToControl: true })));
   await app.syncTailscaleDevices(env, true);
-  assert.equal(db.prepare("SELECT token FROM runtime_state WHERE key = 'monitor-health'").get(), undefined);
-  await app.updateSyncHealth(env);
-  assert.deepEqual({ ...db.prepare("SELECT token, until_at FROM runtime_state WHERE key = 'monitor-health'").get() }, { token: '', until_at: 0 });
-  const changes = db.prepare('SELECT total_changes() AS n').get().n;
-  await app.updateSyncHealth(env);
-  await app.updateSyncHealth(env);
-  assert.equal(db.prepare('SELECT total_changes() AS n').get().n, changes);
-  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM auxiliary_alerts').get().n, 0);
+  const saved = db.prepare('SELECT * FROM servers ORDER BY id').all();
+  for (let minute = 1; minute <= 4; minute++) {
+    clock += 60000;
+    for (const device of devices) device.lastSeen = new Date(clock).toISOString();
+    const before = db.prepare('SELECT total_changes() AS n').get().n;
+    await app.syncTailscaleDevices(env, true);
+    assert.equal(db.prepare('SELECT total_changes() AS n').get().n - before, 3);
+    assert.deepEqual(db.prepare('SELECT * FROM servers ORDER BY id').all(), saved);
+    const visibility = db.prepare("SELECT token,until_at FROM runtime_state WHERE key='visibility'").get();
+    assert.equal(visibility.until_at, now() + 120);
+    assert.deepEqual(JSON.parse(visibility.token), devices.map(device => [device.id, device.lastSeen]));
+    assert.equal(db.prepare('SELECT COUNT(*) AS n FROM notification_outbox').get().n, 0);
+  }
 });
 
-test('health state without a successful sync retains its startup grace period', async t => {
-  const { db, env } = setup(t);
-  const startedAt = now();
-  await app.updateSyncHealth(env);
-  const state = db.prepare("SELECT token, until_at FROM runtime_state WHERE key = 'monitor-health'").get();
-  assert.equal(state.token, '');
-  assert.ok(state.until_at >= startedAt && state.until_at <= now());
-  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM auxiliary_alerts').get().n, 0);
-  db.prepare("UPDATE runtime_state SET until_at = ? WHERE key = 'monitor-health'").run(now() - 301);
-  await app.updateSyncHealth(env);
-  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM auxiliary_alerts WHERE kind = 'sync_lost'").get().n, 1);
+test('a lastSeen-only change refreshes device details without rewriting the saved device', async t => {
+  const { db, env, devices } = setup(t);
+  env.TIME_ZONE = 'UTC';
+  let clock = Date.now();
+  t.mock.method(Date, 'now', () => clock);
+  devices[0].lastSeen = '2026-09-01T00:00:00Z';
+  await app.syncTailscaleDevices(env, false);
+  const saved = db.prepare('SELECT * FROM servers').get();
+  clock += 180000;
+  devices[0].lastSeen = '2026-09-02T03:04:05Z';
+  await app.syncTailscaleDevices(env, false);
+  assert.deepEqual(db.prepare('SELECT * FROM servers').get(), saved);
+  const detail = await app.deviceDetailView(env, 1, 0);
+  assert.match(detail.text, /最後在線：2026-09-02 03:04:05 UTC\+0/);
+  assert.match(detail.text, /資料更新：\d+ 秒前/);
+  assert.doesNotMatch(detail.text, /3 分鐘前|2026-09-01 00:00:00/);
+  devices[0].lastSeen = null;
+  clock += 60000;
+  await app.syncTailscaleDevices(env, false);
+  assert.deepEqual(db.prepare('SELECT * FROM servers').get(), saved);
+  assert.doesNotMatch((await app.deviceDetailView(env, 1, 0)).text, /2026-09-01|2026-09-02/);
 });
 
-test('stale sync alerts once and sends recovery only after an alert was delivered', async t => {
-  const { db, env } = setup(t);
+test('legacy or malformed visibility snapshots fall back to stored lastSeen for details and recovery history', async t => {
+  const { db, env, devices } = setup(t);
+  env.TIME_ZONE = 'UTC';
+  let clock = Date.now();
+  t.mock.method(Date, 'now', () => clock);
+  devices[0].lastSeen = '2026-09-01T01:02:03Z';
   await app.syncTailscaleDevices(env, true);
-  await app.updateSyncHealth(env);
-  db.prepare("UPDATE runtime_state SET until_at = ? WHERE key = 'visibility'").run(now() - 181);
-  await app.updateSyncHealth(env);
-  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM auxiliary_alerts WHERE kind = 'sync_lost'").get().n, 1);
-  await app.updateSyncHealth(env);
-  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM auxiliary_alerts WHERE kind = 'sync_lost'").get().n, 1);
-  await app.drainAuxiliaryAlerts(env, 5);
-  assert.ok(db.prepare("SELECT sent_at FROM auxiliary_alerts WHERE kind = 'sync_lost'").get().sent_at > 0);
+  for (const token of ['', 'not-json', '{}', '[null]']) {
+    db.prepare("UPDATE runtime_state SET token=? WHERE key='visibility'").run(token);
+    assert.match((await app.deviceDetailView(env, 1, 0)).text, /最後在線：2026-09-01 01:02:03 UTC\+0/);
+  }
+  devices[0].connectedToControl = false;
   await app.syncTailscaleDevices(env, true);
-  await app.updateSyncHealth(env);
-  await app.drainAuxiliaryAlerts(env, 5);
-  assert.ok(db.prepare("SELECT sent_at FROM auxiliary_alerts WHERE kind = 'sync_restored'").get().sent_at > 0);
+  clock += 60000;
+  await app.syncTailscaleDevices(env, true);
+  db.prepare("UPDATE runtime_state SET token='not-json' WHERE key='visibility'").run();
+  devices[0].connectedToControl = true;
+  devices[0].lastSeen = '2026-09-02T00:00:00Z';
+  await app.syncTailscaleDevices(env, true);
+  assert.equal(db.prepare("SELECT detail FROM status_events WHERE event='recovered'").get().detail, '2026-09-01T01:02:03Z');
 });
 
-test('sync recovery cancels a lost alert that was never delivered', async t => {
+test('device details suppress a snapshot that expires between the initial freshness check and row read', async t => {
   const { db, env } = setup(t);
-  await app.syncTailscaleDevices(env, true);
-  db.prepare("UPDATE runtime_state SET until_at = ? WHERE key = 'visibility'").run(now() - 181);
-  await app.updateSyncHealth(env);
-  await app.syncTailscaleDevices(env, true);
-  await app.updateSyncHealth(env);
-  assert.ok(db.prepare("SELECT failed_at FROM auxiliary_alerts WHERE kind = 'sync_lost'").get().failed_at > 0);
-  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM auxiliary_alerts WHERE kind = 'sync_restored'").get().n, 0);
+  await app.syncTailscaleDevices(env, false);
+  const prepare = env.STATUS_DB.prepare;
+  env.STATUS_DB.prepare = sql => {
+    const statement = prepare(sql);
+    if (sql.includes('SELECT servers.*')) {
+      const first = statement.first;
+      statement.first = async () => {
+        db.exec("UPDATE runtime_state SET until_at=0 WHERE key='visibility'");
+        return first.call(statement);
+      };
+    }
+    return statement;
+  };
+  const detail = await app.deviceDetailView(env, 1, 0);
+  assert.match(detail.text, /暫無最新設備資料/);
+  assert.doesNotMatch(detail.text, /node/);
 });
 
-test('inventory alerts ignore first sync and hidden tags, then report visible changes', async t => {
+test('changed device metadata is saved once and then stops writing', async t => {
+  const { db, env, devices } = setup(t);
+  let clock = Date.now();
+  t.mock.method(Date, 'now', () => clock);
+  await app.syncTailscaleDevices(env, false);
+  let previous = db.prepare('SELECT * FROM servers').get();
+  for (const change of [
+    { name: 'renamed.example.ts.net' }, { addresses: ['100.64.0.2'] },
+    { tags: ['tag:server'] }, { os: 'linux' }, { expires: '2030-01-01T00:00:00Z' },
+    { clientConnectivity: { endpoints: ['8.8.8.8:41641'] } }
+  ]) {
+    clock += 60000;
+    Object.assign(devices[0], change);
+    await app.syncTailscaleDevices(env, false);
+    const updated = db.prepare('SELECT * FROM servers').get();
+    assert.equal(updated.revision, previous.revision + 1);
+    assert.notEqual(updated.last_results, previous.last_results);
+    clock += 60000;
+    await app.syncTailscaleDevices(env, false);
+    assert.deepEqual(db.prepare('SELECT * FROM servers').get(), updated);
+    previous = updated;
+  }
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM notification_outbox').get().n, 0);
+});
+
+test('existing unbounded counters normalize once without changing status or generating alerts', async t => {
+  const { db, env } = setup(t);
+  await app.syncTailscaleDevices(env, true);
+  db.exec('UPDATE servers SET consecutive_successes=500');
+  await app.syncTailscaleDevices(env, true);
+  const normalized = db.prepare('SELECT * FROM servers').get();
+  assert.equal(normalized.status, 'up');
+  assert.equal(normalized.consecutive_successes, 1);
+  const before = db.prepare('SELECT total_changes() AS n').get().n;
+  await app.syncTailscaleDevices(env, true);
+  assert.deepEqual(db.prepare('SELECT * FROM servers').get(), normalized);
+  assert.equal(db.prepare('SELECT total_changes() AS n').get().n - before, 3);
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM notification_outbox').get().n, 0);
+});
+
+test('unchanged rows stay visible while hidden, removed and reappearing devices retain their identity', async t => {
   const { db, env, devices } = setup(t);
   env.HIDDEN_TAGS = 'tag:personal';
+  devices.push({ id: 'n2', name: 'second.example.ts.net', connectedToControl: true });
   await app.syncTailscaleDevices(env, true);
-  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM auxiliary_alerts').get().n, 0);
-  devices.push({ id: 'n2', name: 'new.example.ts.net', connectedToControl: true, tags: [] });
-  await app.syncTailscaleDevices(env, true);
-  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM auxiliary_alerts WHERE kind = 'device_added'").get().n, 1);
+  const first = db.prepare("SELECT * FROM servers WHERE host='n1'").get();
+  const second = db.prepare("SELECT * FROM servers WHERE host='n2'").get();
   devices[1].tags = ['tag:personal'];
   await app.syncTailscaleDevices(env, true);
-  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM auxiliary_alerts WHERE kind = 'device_removed'").get().n, 0);
-  await app.drainAuxiliaryAlerts(env, 5);
-  assert.ok(db.prepare("SELECT failed_at FROM auxiliary_alerts WHERE kind = 'device_added'").get().failed_at > 0);
+  assert.deepEqual(db.prepare("SELECT * FROM servers WHERE host='n1'").get(), first);
+  assert.equal(db.prepare("SELECT enabled FROM servers WHERE host='n2'").get().enabled, 0);
   devices[1].tags = [];
   await app.syncTailscaleDevices(env, true);
+  let reappeared = db.prepare("SELECT * FROM servers WHERE host='n2'").get();
+  assert.equal(reappeared.id, second.id);
+  assert.equal(reappeared.enabled, 1);
   devices.pop();
   await app.syncTailscaleDevices(env, true);
-  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM auxiliary_alerts WHERE kind = 'device_removed'").get().n, 1);
-  await app.drainAuxiliaryAlerts(env, 5);
-  assert.ok(db.prepare("SELECT sent_at FROM auxiliary_alerts WHERE kind = 'device_removed'").get().sent_at > 0);
+  assert.equal(db.prepare("SELECT enabled FROM servers WHERE host='n2'").get().enabled, 0);
+  devices.push({ id: 'n2', name: 'second.example.ts.net', connectedToControl: false });
+  await app.syncTailscaleDevices(env, true);
+  reappeared = db.prepare("SELECT * FROM servers WHERE host='n2'").get();
+  assert.equal(reappeared.id, second.id);
+  assert.equal(reappeared.enabled, 1);
+  assert.equal(reappeared.status, 'unknown');
+  assert.equal(reappeared.consecutive_failures, 1);
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM notification_outbox').get().n, 0);
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM auxiliary_alerts').get().n, 0);
 });
 
-test('key expiry alert is deduplicated and cancelled if the key is renewed', async t => {
-  const { db, env, devices } = setup(t);
-  devices[0].expires = new Date((now() + 3 * 86400) * 1000).toISOString();
-  await app.syncTailscaleDevices(env, true);
-  await app.syncTailscaleDevices(env, true);
-  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM auxiliary_alerts WHERE kind = 'key_expiring'").get().n, 1);
-  devices[0].expires = new Date((now() + 30 * 86400) * 1000).toISOString();
-  await app.syncTailscaleDevices(env, true);
-  await app.drainAuxiliaryAlerts(env, 5);
-  assert.ok(db.prepare("SELECT failed_at FROM auxiliary_alerts WHERE kind = 'key_expiring'").get().failed_at > 0);
-});
-
-test('auxiliary alerts respect Telegram retry-after without duplicate delivery', async t => {
-  const { db, env, devices } = setup(t);
-  await app.syncTailscaleDevices(env, true);
-  devices.push({ id: 'n2', name: 'second.example.ts.net', connectedToControl: true, tags: [] });
-  await app.syncTailscaleDevices(env, true);
-  const originalFetch = globalThis.fetch;
-  let sends = 0;
-  globalThis.fetch = async (url, init) => {
-    if (String(url).includes('api.telegram.org')) {
-      sends++;
-      if (sends === 1) return response({ ok: false, error_code: 429, parameters: { retry_after: 17 } }, 429);
-    }
-    return originalFetch(url, init);
-  };
-  await app.drainAuxiliaryAlerts(env, 5);
-  const row = db.prepare("SELECT attempts, sent_at, next_attempt_at FROM auxiliary_alerts WHERE kind = 'device_added'").get();
-  assert.equal(row.attempts, 1);
-  assert.equal(row.sent_at, 0);
-  assert.ok(row.next_attempt_at >= now() + 16);
-  await app.drainAuxiliaryAlerts(env, 5);
-  assert.equal(sends, 1);
+test('only offline and recovery are sent; legacy auxiliary alerts and inventory changes stay silent', async t => {
+  const { db, env, devices, calls } = setup(t);
+  devices[0].expires = new Date((now() + 86400) * 1000).toISOString();
+  db.exec("INSERT INTO auxiliary_alerts(alert_key,kind,created_at) VALUES('legacy','sync_lost',1)");
+  await app.runScheduledChecks({}, env);
+  devices.push({ id: 'n2', name: 'second', connectedToControl: true });
+  await app.runScheduledChecks({}, env);
+  devices.pop();
+  await app.runScheduledChecks({}, env);
+  assert.equal(calls.filter(url => url.includes('api.telegram.org')).length, 0);
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM auxiliary_alerts').get().n, 1);
+  assert.equal(db.prepare("SELECT sent_at FROM auxiliary_alerts WHERE alert_key='legacy'").get().sent_at, 0);
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM runtime_state WHERE key LIKE 'monitor-health%'").get().n, 0);
 });
 
 test('expired sync lease is fenced even if a new worker acquired it', async t => {
@@ -568,21 +607,75 @@ test('expired sync lease is fenced even if a new worker acquired it', async t =>
 
 test('rapid refresh does not count another offline observation; recovery event retains previous lastSeen', async t => {
   const { db, env, devices } = setup(t);
+  let clock = Date.now();
+  t.mock.method(Date, 'now', () => clock);
   await app.syncTailscaleDevices(env, true);
+  clock += 60000;
   devices[0].connectedToControl = false;
   devices[0].lastSeen = '2026-09-01T00:00:00Z';
   await app.syncTailscaleDevices(env, true);
+  const firstFailure = db.prepare('SELECT * FROM servers').get();
+  assert.equal(firstFailure.status, 'up');
+  assert.equal(firstFailure.consecutive_failures, 1);
+  clock += 59000;
   await app.syncTailscaleDevices(env, true);
-  assert.equal(db.prepare('SELECT consecutive_failures FROM servers').get().consecutive_failures, 1);
-  db.exec(`UPDATE servers SET last_results = json_set(last_results, '$[0].observationAt', ${now() - 61})`);
+  assert.deepEqual(db.prepare('SELECT * FROM servers').get(), firstFailure);
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM notification_outbox').get().n, 0);
+  clock += 1000;
   await app.syncTailscaleDevices(env, true);
-  assert.equal(db.prepare('SELECT status FROM servers').get().status, 'down');
+  const down = db.prepare('SELECT * FROM servers').get();
+  assert.equal(down.status, 'down');
+  assert.equal(down.consecutive_failures, 2);
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM notification_outbox WHERE event='down'").get().n, 1);
+  for (let minute = 0; minute < 3; minute++) {
+    clock += 60000;
+    devices[0].lastSeen = '2026-09-01T01:02:03Z';
+    const before = db.prepare('SELECT total_changes() AS n').get().n;
+    await app.syncTailscaleDevices(env, true);
+    assert.equal(db.prepare('SELECT total_changes() AS n').get().n - before, 3);
+    assert.deepEqual(db.prepare('SELECT * FROM servers').get(), down);
+  }
+  clock += 1000;
   devices[0].connectedToControl = true;
   devices[0].lastSeen = '2026-09-02T00:00:00Z';
   await app.syncTailscaleDevices(env, true);
+  const recovered = db.prepare('SELECT * FROM servers').get();
+  assert.equal(recovered.status, 'up');
+  assert.equal(recovered.consecutive_failures, 0);
+  assert.equal(recovered.consecutive_successes, 1);
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM notification_outbox WHERE event='recovered'").get().n, 1);
   const payload = JSON.parse(db.prepare("SELECT payload FROM notification_outbox WHERE event = 'recovered'").get().payload);
-  assert.equal(db.prepare("SELECT detail FROM status_events WHERE event = 'recovered'").get().detail, '2026-09-01T00:00:00Z');
+  assert.equal(db.prepare("SELECT detail FROM status_events WHERE event = 'recovered'").get().detail, '2026-09-01T01:02:03Z');
   assert.equal(Object.hasOwn(payload, 'previousLastSeen'), false);
+  clock += 60000;
+  await app.syncTailscaleDevices(env, true);
+  assert.deepEqual(db.prepare('SELECT * FROM servers').get(), recovered);
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM notification_outbox').get().n, 2);
+});
+
+test('a first offline device remains pending until the second observation and clears a single failed observation immediately', async t => {
+  const { db, env, devices } = setup(t);
+  let clock = Date.now();
+  t.mock.method(Date, 'now', () => clock);
+  devices[0].connectedToControl = false;
+  await app.syncTailscaleDevices(env, true);
+  assert.equal(db.prepare('SELECT status FROM servers').get().status, 'unknown');
+  clock += 60000;
+  await app.syncTailscaleDevices(env, true);
+  assert.equal(db.prepare('SELECT status FROM servers').get().status, 'down');
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM notification_outbox WHERE event='down'").get().n, 1);
+  devices[0].connectedToControl = true;
+  await app.syncTailscaleDevices(env, true);
+  assert.equal(db.prepare('SELECT status FROM servers').get().status, 'up');
+  clock += 60000;
+  devices[0].connectedToControl = false;
+  await app.syncTailscaleDevices(env, true);
+  devices[0].connectedToControl = true;
+  await app.syncTailscaleDevices(env, true);
+  const online = db.prepare('SELECT * FROM servers').get();
+  assert.equal(online.status, 'up');
+  assert.equal(online.consecutive_failures, 0);
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM notification_outbox').get().n, 2);
 });
 
 test('personal tag after 32 entries hides device and cancels unsent notifications atomically', async t => {
@@ -667,22 +760,6 @@ test('sync failure does not stop pending delivery with fresh visibility, stale v
   const view = await app.dashboardView(env);
   assert.match(view.text, /暫無最新設備資料/);
   assert.ok(!view.text.includes('node'));
-});
-
-test('scheduled status delivery runs before auxiliary work', async t => {
-  const { db, env } = setup(t);
-  await app.syncTailscaleDevices(env, false);
-  db.prepare("INSERT INTO notification_outbox(server_id,check_token,event,payload,created_at) VALUES (1,'priority','down',?,1)").run(JSON.stringify({ id: 1, name: 'node', device: {}, event: 'down', eventTime: 1 }));
-  const prepare = env.STATUS_DB.prepare;
-  let deliveredBeforeAuxiliary = false;
-  env.STATUS_DB.prepare = sql => {
-    if (sql.includes("INSERT OR IGNORE INTO runtime_state") && sql.includes("monitor-health")) {
-      deliveredBeforeAuxiliary = db.prepare("SELECT sent_at FROM notification_outbox WHERE check_token='priority'").get().sent_at > 0;
-    }
-    return prepare(sql);
-  };
-  await app.runScheduledChecks({}, env);
-  assert.equal(deliveredBeforeAuxiliary, true);
 });
 
 test('an interrupted delivery cannot block the next minute of device sync', async t => {
@@ -805,13 +882,19 @@ test('notification queue stops after a 429 and resumes only after cooldown', asy
 
 test('sync transaction failure rolls back all device and visibility changes', async t => {
   const { db, env, devices } = setup(t);
+  let clock = Date.now();
+  t.mock.method(Date, 'now', () => clock);
   await app.syncTailscaleDevices(env, false);
+  const previous = db.prepare('SELECT * FROM servers').all();
+  const visibility = db.prepare("SELECT token,until_at FROM runtime_state WHERE key='visibility'").get();
   db.exec("CREATE TRIGGER reject_new BEFORE INSERT ON servers WHEN NEW.host = 'bad' BEGIN SELECT RAISE(ABORT, 'test failure'); END");
   devices[0].connectedToControl = false;
+  devices[0].lastSeen = '2026-09-01T01:02:03Z';
+  clock += 60000;
   devices.push({ id: 'bad', name: 'bad', connectedToControl: true });
   await assert.rejects(app.syncTailscaleDevices(env, false), /test failure/);
-  assert.equal(db.prepare('SELECT consecutive_failures FROM servers WHERE host = ?').get('n1').consecutive_failures, 0);
-  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM servers').get().n, 1);
+  assert.deepEqual(db.prepare('SELECT * FROM servers').all(), previous);
+  assert.deepEqual(db.prepare("SELECT token,until_at FROM runtime_state WHERE key='visibility'").get(), visibility);
 });
 
 test('expired visibility prevents notification delivery during upstream outage', async t => {

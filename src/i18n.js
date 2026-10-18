@@ -35,13 +35,6 @@ export const messages = {
     ageHours: (n) => `${n} 小時前`,
     ageDays: (n) => `${n} 天前`,
     syncFailed: "更新失敗，請稍後重試。",
-    syncLostTitle: "設備資料更新中斷",
-    syncLostBody: "已至少 5 分鐘未能更新設備資料，狀態可能不是最新。",
-    syncRestoredTitle: "設備資料更新恢復",
-    deviceAddedTitle: "設備加入清單",
-    deviceRemovedTitle: "設備離開清單",
-    keyExpiringTitle: "設備金鑰即將到期",
-    keyExpires: "到期時間",
     colon: "："
   },
   ja: {
@@ -80,13 +73,6 @@ export const messages = {
     ageHours: (n) => `${n} 時間前`,
     ageDays: (n) => `${n} 日前`,
     syncFailed: "更新に失敗しました。しばらくしてからお試しください。",
-    syncLostTitle: "端末データの更新が停止",
-    syncLostBody: "端末データを 5 分以上更新できていません。状態が古い可能性があります。",
-    syncRestoredTitle: "端末データの更新が再開",
-    deviceAddedTitle: "端末が一覧に追加されました",
-    deviceRemovedTitle: "端末が一覧から消えました",
-    keyExpiringTitle: "端末キーの有効期限が近づいています",
-    keyExpires: "有効期限",
     colon: "："
   },
   en: {
@@ -125,13 +111,6 @@ export const messages = {
     ageHours: (n) => `${n} ${n === 1 ? "hour" : "hours"} ago`,
     ageDays: (n) => `${n} ${n === 1 ? "day" : "days"} ago`,
     syncFailed: "Update failed. Try again later.",
-    syncLostTitle: "Device updates interrupted",
-    syncLostBody: "Device data has not updated for at least 5 minutes. Status may be out of date.",
-    syncRestoredTitle: "Device updates resumed",
-    deviceAddedTitle: "Device added to list",
-    deviceRemovedTitle: "Device no longer listed",
-    keyExpiringTitle: "Device key expiring soon",
-    keyExpires: "Expires at",
     colon: ": "
   }
 };

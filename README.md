@@ -80,9 +80,7 @@ Webhook 工具會隱藏輸入 Bot Token 與同一個 `WEBHOOK_SECRET`，並註�
 
 僅管理者可在私聊操作：`/start` 查看最近設備資料、`/status` 更新總覽、`/list` 查看列表、`/device ID` 查看詳情。總覽與列表每頁 10 台；IP 不顯示，但按 IP 排序，離線設備不置頂。
 
-每分鐘更新一次。預設連續兩次有效離線觀察、相隔至少 60 秒才確認離線；取得有效在線結果後通知恢復。API 錯誤不算設備離線。通知分別顯示「最後在線」或「恢復時間」，不是 Telegram 送達時間。
-
-另會提醒資料更新中斷至少 5 分鐘及恢復、可見設備加入／離開清單，以及金鑰到期前 7 天內的狀態。初次建立清單不發新增通知；金鑰提醒需 API 提供到期時間。
+每分鐘取得一次 API 資料，只發設備離線與恢復通知。預設連續兩次有效離線觀察、相隔至少 60 秒才確認離線；取得有效在線結果後通知恢復。API 錯誤不算設備離線。通知分別顯示「最後在線」或「恢復時間」，不是 Telegram 送達時間。
 
 先將範例網址替換為自己的 Worker 網址：
 
@@ -96,7 +94,7 @@ Invoke-RestMethod https://YOUR_WORKER.workers.dev/health
 
 ### 升級
 
-升級時請套用全部 D1 遷移。`0008` 會移除已不再使用的設備到期索引，減少每分鐘寫入；設備資料與檢查頻率不變。
+升級時請套用全部 D1 遷移。`0008` 會移除已不用的設備到期索引。本版僅在設備狀態或資料改變時更新設備記錄，並共用每輪的最新檢查時間，減少 D1 寫入；每分鐘檢查、離線確認及恢復通知速度不變。
 
 備份資料，保留原有設定、資源 ID、Secrets 與遷移歷史，不重跑 `Copy-Item` 或 `d1 create`。對照[設定範例](wrangler.jsonc.example)補缺少的設定；舊設定若沒有 `durable_objects` 與 `migrations`，補上對應區塊，保留 `SCHEDULER` 與 `scheduler-v1`。
 
@@ -198,9 +196,7 @@ Webhook ツールで Bot Token と同じ `WEBHOOK_SECRET` を非表示で入力�
 
 管理者だけが個人チャットで操作できます。`/start` は最近の端末データ、`/status` は概要を更新、`/list` は一覧、`/device ID` は詳細を表示します。概要と一覧は 1 ページ 10 台です。IP は非表示ですが IP 順に並び、オフライン端末は先頭に移動しません。
 
-毎分更新します。既定では 60 秒以上離れた有効なオフライン観測が 2 回続くと判定し、有効なオンライン結果を得た後に復旧を通知します。API エラーは端末のオフラインとは扱いません。通知には最終オンライン時刻または復旧時刻を表示します。Telegram への配信時刻ではありません。
-
-更新が 5 分以上途絶えた場合と復旧時、表示対象の端末が一覧に追加されたとき・一覧から消えたとき、キーの期限前 7 日以内にも通知します。初回の一覧作成では追加通知は送りません。キー通知には API の期限情報が必要です。
+毎分 API からデータを取得し、端末のオフラインと復旧だけを通知します。既定では 60 秒以上離れた有効なオフライン観測が 2 回続くと判定し、有効なオンライン結果を得た後に復旧を通知します。API エラーは端末のオフラインとは扱いません。通知には最終オンライン時刻または復旧時刻を表示します。Telegram への配信時刻ではありません。
 
 例の URL を自分の Worker URL に置き換えます。
 
@@ -214,7 +210,7 @@ Invoke-RestMethod https://YOUR_WORKER.workers.dev/health
 
 ### 更新
 
-更新時は D1 マイグレーションをすべて適用してください。`0008` は未使用の端末チェック期限インデックスを削除し、毎分の書き込みを減らします。端末データとチェック間隔は変わりません。
+更新時は D1 マイグレーションをすべて適用してください。`0008` は未使用の端末チェック期限インデックスを削除します。この版では端末の状態やデータが変わったときだけ端末レコードを更新し、各回の確認時刻をまとめて保存することで D1 書き込みを減らします。毎分の確認、オフライン判定、復旧通知の速さは変わりません。
 
 データをバックアップし、設定、リソース ID、Secrets、マイグレーション履歴を保持します。`Copy-Item` と `d1 create` は再実行しません。[設定例](wrangler.jsonc.example)と比較し、不足する設定だけを追加します。古い設定に `durable_objects` と `migrations` がない場合は対応するブロックを補い、`SCHEDULER` と `scheduler-v1` を保持してください。
 
@@ -315,9 +311,7 @@ The webhook tool securely prompts for the Bot Token and the same `WEBHOOK_SECRET
 
 Only the administrator can use the bot in a private chat. `/start` shows recent device data, `/status` refreshes the overview, `/list` lists devices, and `/device ID` shows details. Overview and list pages hold ten devices. IPs are hidden but determine sorting; offline devices are not moved to the top.
 
-Data updates every minute. By default, two valid offline observations at least 60 seconds apart confirm an outage; a valid online result triggers recovery. API failures do not count as device outages. Alerts show the last online or recovery time, not the Telegram delivery time.
-
-Other alerts cover updates interrupted for at least five minutes and resumed, visible devices joining/leaving the list, and keys expiring within seven days. The initial inventory sends no new-device alerts. Key warnings require an API-supplied expiry time.
+The bot fetches API data every minute and sends only offline and recovery alerts. By default, two valid offline observations at least 60 seconds apart confirm an outage; a valid online result triggers recovery. API failures do not count as device outages. Alerts show the last online or recovery time, not the Telegram delivery time.
 
 Replace the example URL with your Worker URL:
 
@@ -331,7 +325,7 @@ Invoke-RestMethod https://YOUR_WORKER.workers.dev/health
 
 ### Upgrading
 
-Apply all D1 migrations when upgrading. `0008` removes the unused device due-time index to reduce writes per minute. Device data and the check interval are unchanged.
+Apply all D1 migrations when upgrading. `0008` removes the unused device due-time index. This version updates device records only when their state or data changes and stores each round's latest check times together to reduce D1 writes. Minute-by-minute checks, offline confirmation, and recovery alert timing are unchanged.
 
 Back up data and keep existing settings, resource IDs, secrets, and migration history. Do not rerun `Copy-Item` or `d1 create`. Compare the [config example](wrangler.jsonc.example) and add missing settings only. If an older config lacks `durable_objects` and `migrations`, add those blocks, retaining `SCHEDULER` and `scheduler-v1`.
 
