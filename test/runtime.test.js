@@ -678,6 +678,110 @@ test('a first offline device remains pending until the second observation and cl
   assert.equal(db.prepare('SELECT COUNT(*) AS n FROM notification_outbox').get().n, 2);
 });
 
+test('a transient disconnect after many skipped writes clears without offline or recovery notifications', async t => {
+  const { db, env, devices, calls } = setup(t);
+  let clock = Date.now();
+  t.mock.method(Date, 'now', () => clock);
+  await app.runScheduledChecks({}, env);
+  const saved = db.prepare('SELECT * FROM servers').get();
+  for (let minute = 0; minute < 60; minute++) {
+    clock += 60000;
+    devices[0].lastSeen = new Date(clock).toISOString();
+    await app.runScheduledChecks({}, env);
+  }
+  assert.deepEqual(db.prepare('SELECT * FROM servers').get(), saved);
+  devices[0].connectedToControl = false;
+  await app.runScheduledChecks({}, env);
+  assert.equal(db.prepare('SELECT consecutive_failures FROM servers').get().consecutive_failures, 1);
+  clock += 59000;
+  await app.runScheduledChecks({}, env);
+  devices[0].connectedToControl = true;
+  await app.runScheduledChecks({}, env);
+  clock += 60000;
+  await app.runScheduledChecks({}, env);
+  const recovered = db.prepare('SELECT * FROM servers').get();
+  assert.equal(recovered.status, 'up');
+  assert.equal(recovered.consecutive_failures, 0);
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM status_events').get().n, 0);
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM notification_outbox').get().n, 0);
+  assert.equal(calls.filter(url => url.includes('api.telegram.org')).length, 0);
+});
+
+test('metadata writes during a pending disconnect do not postpone its sixty-second confirmation', async t => {
+  const { db, env, devices } = setup(t);
+  let clock = Date.now();
+  t.mock.method(Date, 'now', () => clock);
+  await app.syncTailscaleDevices(env, true);
+  devices[0].connectedToControl = false;
+  await app.syncTailscaleDevices(env, true);
+  const observedAt = now();
+  for (const seconds of [30, 29]) {
+    clock += seconds * 1000;
+    devices[0].name = `renamed-${now()}.example.ts.net`;
+    await app.syncTailscaleDevices(env, true);
+    const pending = db.prepare('SELECT * FROM servers').get();
+    assert.equal(pending.status, 'up');
+    assert.equal(pending.consecutive_failures, 1);
+    assert.equal(JSON.parse(pending.last_results)[0].observationAt, observedAt);
+    assert.equal(pending.last_checked_at, now());
+    assert.equal(db.prepare('SELECT COUNT(*) AS n FROM notification_outbox').get().n, 0);
+  }
+  clock += 1000;
+  await app.syncTailscaleDevices(env, true);
+  assert.equal(db.prepare('SELECT status FROM servers').get().status, 'down');
+  assert.equal(db.prepare('SELECT created_at FROM notification_outbox').get().created_at, observedAt + 60);
+});
+
+test('concurrent drains retry offline before recovery and never resend successful status notifications', async t => {
+  const { db, env, devices } = setup(t);
+  let clock = Date.now();
+  t.mock.method(Date, 'now', () => clock);
+  await app.syncTailscaleDevices(env, true);
+  const fetchImpl = globalThis.fetch;
+  const accepted = [];
+  let rejectOnce = true;
+  let attempts = 0;
+  globalThis.fetch = async (url, init) => {
+    if (!String(url).includes('api.telegram.org')) return fetchImpl(url, init);
+    attempts++;
+    if (rejectOnce) {
+      rejectOnce = false;
+      return response({ ok: false, error_code: 503, description: 'temporarily unavailable' }, 503);
+    }
+    accepted.push(JSON.parse(init.body).text);
+    return response({ ok: true, result: { message_id: accepted.length } });
+  };
+  devices[0].connectedToControl = false;
+  await app.syncTailscaleDevices(env, true);
+  clock += 60000;
+  await app.syncTailscaleDevices(env, true);
+  await Promise.all(Array.from({ length: 3 }, () => app.drainNotificationOutbox(env, 5)));
+  assert.equal(attempts, 1);
+  assert.equal(accepted.length, 0);
+  const retryAt = db.prepare('SELECT next_attempt_at FROM notification_outbox').get().next_attempt_at;
+  devices[0].connectedToControl = true;
+  await app.syncTailscaleDevices(env, true);
+  await Promise.all(Array.from({ length: 3 }, () => app.drainNotificationOutbox(env, 5)));
+  assert.equal(attempts, 1);
+  clock = retryAt * 1000;
+  await app.syncTailscaleDevices(env, true);
+  await Promise.all(Array.from({ length: 3 }, () => app.drainNotificationOutbox(env, 5)));
+  assert.equal(attempts, 3);
+  assert.equal(accepted.length, 2);
+  assert.match(accepted[0], /設備離線/);
+  assert.match(accepted[1], /設備恢復/);
+  assert.deepEqual(db.prepare('SELECT event,attempts,sent_at>0 AS sent FROM notification_outbox ORDER BY id').all().map(row => ({ ...row })), [
+    { event: 'down', attempts: 1, sent: 1 }, { event: 'recovered', attempts: 0, sent: 1 }
+  ]);
+  for (let minute = 0; minute < 3; minute++) {
+    clock += 60000;
+    await app.runScheduledChecks({}, env);
+    await Promise.all(Array.from({ length: 3 }, () => app.drainNotificationOutbox(env, 5)));
+  }
+  assert.equal(attempts, 3);
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM status_events').get().n, 2);
+});
+
 test('personal tag after 32 entries hides device and cancels unsent notifications atomically', async t => {
   const { db, env, devices } = setup(t);
   await app.syncTailscaleDevices(env, false);

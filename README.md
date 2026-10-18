@@ -82,6 +82,8 @@ Webhook 工具會隱藏輸入 Bot Token 與同一個 `WEBHOOK_SECRET`，並註�
 
 每分鐘取得一次 API 資料，只發設備離線與恢復通知。預設連續兩次有效離線觀察、相隔至少 60 秒才確認離線；取得有效在線結果後通知恢復。API 錯誤不算設備離線。通知分別顯示「最後在線」或「恢復時間」，不是 Telegram 送達時間。
 
+狀態事件與待送通知一起保存，同一設備按事件順序重試；已記錄送出成功的通知不再重送。未達離線門檻就恢復在線，不發離線或恢復通知。
+
 先將範例網址替換為自己的 Worker 網址：
 
 ```powershell
@@ -95,6 +97,8 @@ Invoke-RestMethod https://YOUR_WORKER.workers.dev/health
 ### 升級
 
 升級時請套用全部 D1 遷移。`0008` 會移除已不用的設備到期索引。本版僅在設備狀態或資料改變時更新設備記錄，並共用每輪的最新檢查時間，減少 D1 寫入；每分鐘檢查、離線確認及恢復通知速度不變。
+
+設備未變時，個別記錄的檢查時間不會每分鐘重寫；資料新鮮度以每輪共用快照為準。首次離線觀察仍立即保存，60 秒內重複更新不會多算確認次數。
 
 備份資料，保留原有設定、資源 ID、Secrets 與遷移歷史，不重跑 `Copy-Item` 或 `d1 create`。對照[設定範例](wrangler.jsonc.example)補缺少的設定；舊設定若沒有 `durable_objects` 與 `migrations`，補上對應區塊，保留 `SCHEDULER` 與 `scheduler-v1`。
 
@@ -116,7 +120,7 @@ GeoIP 預設關閉。啟用後，公開端點 IP 可能送至 [Country.is](https
 
 設定、憑證、資料庫匯出、備份與日誌不應提交或公開。提交前檢查 Git 追蹤內容，求助時遮蔽秘密值與私人識別資料；輸入秘密時避免終端錄製或螢幕分享。
 
-排程、API 或 Telegram 故障／限流可能延遲通知，重試也可能造成重複；Worker 完全停止時無法即時告警。可使用 Cloudflare 免費方案，配額與費用見[官方定價](https://developers.cloudflare.com/durable-objects/platform/pricing/)。
+排程、API 或 Telegram 故障／限流可能延遲通知。若 Telegram 已收件但回應遺失，或送出後未能保存成功狀態，重試仍可能重複，無法保證恰好一次送達；Worker 完全停止時無法即時告警。可使用 Cloudflare 免費方案，配額與費用見[官方定價](https://developers.cloudflare.com/durable-objects/platform/pricing/)。
 
 <a id="ja"></a>
 
@@ -198,6 +202,8 @@ Webhook ツールで Bot Token と同じ `WEBHOOK_SECRET` を非表示で入力�
 
 毎分 API からデータを取得し、端末のオフラインと復旧だけを通知します。既定では 60 秒以上離れた有効なオフライン観測が 2 回続くと判定し、有効なオンライン結果を得た後に復旧を通知します。API エラーは端末のオフラインとは扱いません。通知には最終オンライン時刻または復旧時刻を表示します。Telegram への配信時刻ではありません。
 
+状態イベントと送信待ち通知をまとめて保存し、同じ端末の通知はイベント順に再試行します。送信成功を記録した通知は再送しません。判定回数に達する前に接続が戻った場合、オフライン・復旧通知は送りません。
+
 例の URL を自分の Worker URL に置き換えます。
 
 ```powershell
@@ -211,6 +217,8 @@ Invoke-RestMethod https://YOUR_WORKER.workers.dev/health
 ### 更新
 
 更新時は D1 マイグレーションをすべて適用してください。`0008` は未使用の端末チェック期限インデックスを削除します。この版では端末の状態やデータが変わったときだけ端末レコードを更新し、各回の確認時刻をまとめて保存することで D1 書き込みを減らします。毎分の確認、オフライン判定、復旧通知の速さは変わりません。
+
+端末に変化がない場合、個別レコードの確認時刻は毎分更新されません。データの鮮度は各回の共通スナップショットで判断します。最初のオフライン観測はすぐ保存し、60 秒以内の再更新は判定回数に加えません。
 
 データをバックアップし、設定、リソース ID、Secrets、マイグレーション履歴を保持します。`Copy-Item` と `d1 create` は再実行しません。[設定例](wrangler.jsonc.example)と比較し、不足する設定だけを追加します。古い設定に `durable_objects` と `migrations` がない場合は対応するブロックを補い、`SCHEDULER` と `scheduler-v1` を保持してください。
 
@@ -232,7 +240,7 @@ GeoIP は既定で無効です。有効にすると公開エンドポイント I
 
 設定、資格情報、DB エクスポート、バックアップ、ログはコミット・公開しないでください。Git の追跡対象を確認し、相談時は秘密値や個人情報を伏せてください。秘密値の入力中はターミナルの記録や画面共有を避けてください。
 
-スケジュール・API・Telegram の障害やレート制限で通知が遅れ、再試行で重複する場合があります。Worker の完全停止時には即時警報を出せません。Cloudflare 無料プランでも利用でき、利用枠と料金は[公式料金表](https://developers.cloudflare.com/durable-objects/platform/pricing/)を確認してください。
+スケジュール・API・Telegram の障害やレート制限で通知が遅れる場合があります。Telegram が受信した後に応答が失われたり、送信成功を保存できなかったりすると、再試行で重複する可能性があり、厳密な一度だけの配信は保証できません。Worker の完全停止時には即時警報を出せません。Cloudflare 無料プランでも利用でき、利用枠と料金は[公式料金表](https://developers.cloudflare.com/durable-objects/platform/pricing/)を確認してください。
 
 <a id="en"></a>
 
@@ -313,6 +321,8 @@ Only the administrator can use the bot in a private chat. `/start` shows recent 
 
 The bot fetches API data every minute and sends only offline and recovery alerts. By default, two valid offline observations at least 60 seconds apart confirm an outage; a valid online result triggers recovery. API failures do not count as device outages. Alerts show the last online or recovery time, not the Telegram delivery time.
 
+Status events and pending alerts are saved together. Alerts for each device are retried in event order and are not resent once successful delivery is recorded. A disconnect that clears before confirmation sends neither an offline nor a recovery alert.
+
 Replace the example URL with your Worker URL:
 
 ```powershell
@@ -326,6 +336,8 @@ Invoke-RestMethod https://YOUR_WORKER.workers.dev/health
 ### Upgrading
 
 Apply all D1 migrations when upgrading. `0008` removes the unused device due-time index. This version updates device records only when their state or data changes and stores each round's latest check times together to reduce D1 writes. Minute-by-minute checks, offline confirmation, and recovery alert timing are unchanged.
+
+An unchanged device's own check timestamp is not rewritten every minute; freshness comes from the shared snapshot for each round. The first offline observation is still saved immediately, and repeated refreshes within 60 seconds do not add confirmations.
 
 Back up data and keep existing settings, resource IDs, secrets, and migration history. Do not rerun `Copy-Item` or `d1 create`. Compare the [config example](wrangler.jsonc.example) and add missing settings only. If an older config lacks `durable_objects` and `migrations`, add those blocks, retaining `SCHEDULER` and `scheduler-v1`.
 
@@ -347,6 +359,6 @@ GeoIP is off by default. If enabled, public endpoint IPs may be sent to [Country
 
 Do not commit or publish settings, credentials, database exports, backups, or logs. Check Git's tracked files and redact secrets and private identifiers when seeking help. Avoid terminal recording or screen sharing while entering secrets.
 
-Schedule, API, or Telegram failures and rate limits can delay alerts; retries can duplicate them. A stopped Worker cannot alert immediately. The Cloudflare free plan is supported; consult [official pricing](https://developers.cloudflare.com/durable-objects/platform/pricing/) for limits and charges.
+Schedule, API, or Telegram failures and rate limits can delay alerts. If Telegram accepts a message but its response is lost, or delivery succeeds without being recorded, a retry may duplicate it; exactly-once delivery is not guaranteed. A stopped Worker cannot alert immediately. The Cloudflare free plan is supported; consult [official pricing](https://developers.cloudflare.com/durable-objects/platform/pricing/) for limits and charges.
 
 Copyright (C) 2026 kk311intl.
