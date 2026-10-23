@@ -80,6 +80,8 @@ Webhook 工具會隱藏輸入 Bot Token 與同一個 `WEBHOOK_SECRET`，並註�
 
 僅管理者可在私聊操作：`/start` 查看最近設備資料、`/status` 更新總覽、`/list` 查看列表、`/device ID` 查看詳情。總覽與列表每頁 10 台；IP 不顯示，但按 IP 排序，離線設備不置頂。
 
+返回總覽、翻頁與查看詳情使用最近快照；按「更新狀態」或使用 `/status` 才主動查詢 API。手動更新先回覆畫面，新通知隨後在背景發送，無新通知時不額外喚起背景工作。
+
 每分鐘取得一次 API 資料，只發設備離線與恢復通知。預設連續兩次有效離線觀察、相隔至少 60 秒才確認離線；取得有效在線結果後通知恢復。API 錯誤不算設備離線。通知分別顯示「最後在線」或「恢復時間」，不是 Telegram 送達時間。
 
 狀態事件與待送通知一起保存，同一設備按事件順序重試；已記錄送出成功的通知不再重送。未達離線門檻就恢復在線，不發離線或恢復通知。
@@ -117,6 +119,8 @@ pnpm exec wrangler deploy --config wrangler.jsonc
 D1 保存設備名稱、標籤、Tailscale IP、公開端點 IP、狀態與時間等資料。隱藏 IP 不代表匿名化；`HIDDEN_TAGS` 不刪除已保存資料，也不限制 OAuth 的 API 讀取權限。
 
 GeoIP 預設關閉。啟用後，公開端點 IP 可能送至 [Country.is](https://country.is/) 推斷國旗。API 無法確認目前活躍介面，VPN、代理或多個端點都可能影響結果；國旗不保證是設備實際所在地。
+
+國旗查詢在排程保存狀態與處理通知後執行，沿用 7 天快取，失敗後等 6 小時再查；通知不等待國旗。一般穩定檢查不增加每分鐘 D1 寫入，只有快取需要更新時才另行保存。
 
 設定、憑證、資料庫匯出、備份與日誌不應提交或公開。提交前檢查 Git 追蹤內容，求助時遮蔽秘密值與私人識別資料；輸入秘密時避免終端錄製或螢幕分享。
 
@@ -200,6 +204,8 @@ Webhook ツールで Bot Token と同じ `WEBHOOK_SECRET` を非表示で入力�
 
 管理者だけが個人チャットで操作できます。`/start` は最近の端末データ、`/status` は概要を更新、`/list` は一覧、`/device ID` は詳細を表示します。概要と一覧は 1 ページ 10 台です。IP は非表示ですが IP 順に並び、オフライン端末は先頭に移動しません。
 
+概要への移動、ページ切り替え、詳細表示には直近のスナップショットを使います。「状態を更新」または `/status` で API を取得します。手動更新では画面を先に返し、新しい通知をバックグラウンドで送ります。新しい通知がなければ追加のバックグラウンド処理は起動しません。
+
 毎分 API からデータを取得し、端末のオフラインと復旧だけを通知します。既定では 60 秒以上離れた有効なオフライン観測が 2 回続くと判定し、有効なオンライン結果を得た後に復旧を通知します。API エラーは端末のオフラインとは扱いません。通知には最終オンライン時刻または復旧時刻を表示します。Telegram への配信時刻ではありません。
 
 状態イベントと送信待ち通知をまとめて保存し、同じ端末の通知はイベント順に再試行します。送信成功を記録した通知は再送しません。判定回数に達する前に接続が戻った場合、オフライン・復旧通知は送りません。
@@ -237,6 +243,8 @@ pnpm exec wrangler deploy --config wrangler.jsonc
 D1 には端末名、タグ、Tailscale IP、公開エンドポイント IP、状態、時刻などが保存されます。IP の非表示は匿名化ではありません。`HIDDEN_TAGS` は保存済みデータを削除せず、OAuth の API 読み取り権限も制限しません。
 
 GeoIP は既定で無効です。有効にすると公開エンドポイント IP を [Country.is](https://country.is/) に送信して国旗を推定する場合があります。API では現在有効なインターフェースを判別できず、VPN・プロキシ・複数のエンドポイントも影響するため、実際の所在地は保証できません。
+
+国旗は定期処理で状態の保存と通知の処理を終えてから取得します。キャッシュは 7 日間、失敗時の再試行間隔は 6 時間です。通知は国旗の取得を待ちません。通常の安定したチェックで毎分の D1 書き込みは増えず、キャッシュの更新が必要なときだけ追加で保存します。
 
 設定、資格情報、DB エクスポート、バックアップ、ログはコミット・公開しないでください。Git の追跡対象を確認し、相談時は秘密値や個人情報を伏せてください。秘密値の入力中はターミナルの記録や画面共有を避けてください。
 
@@ -319,6 +327,8 @@ The webhook tool securely prompts for the Bot Token and the same `WEBHOOK_SECRET
 
 Only the administrator can use the bot in a private chat. `/start` shows recent device data, `/status` refreshes the overview, `/list` lists devices, and `/device ID` shows details. Overview and list pages hold ten devices. IPs are hidden but determine sorting; offline devices are not moved to the top.
 
+Returning to the overview, paging, and viewing details use the latest snapshot. Only the refresh button or `/status` requests fresh API data. Manual refreshes reply with the view first, then send new alerts in the background. No extra background work starts when no new alerts were queued.
+
 The bot fetches API data every minute and sends only offline and recovery alerts. By default, two valid offline observations at least 60 seconds apart confirm an outage; a valid online result triggers recovery. API failures do not count as device outages. Alerts show the last online or recovery time, not the Telegram delivery time.
 
 Status events and pending alerts are saved together. Alerts for each device are retried in event order and are not resent once successful delivery is recorded. A disconnect that clears before confirmation sends neither an offline nor a recovery alert.
@@ -356,6 +366,8 @@ Unchanged secrets need no re-entry. Rerun the [webhook tool](tools/Register-Tele
 D1 stores device names, tags, Tailscale IPs, public endpoint IPs, status, timestamps, and related monitoring data. Hiding IPs does not anonymize data. `HIDDEN_TAGS` does not delete stored records or restrict OAuth API read access.
 
 GeoIP is off by default. If enabled, public endpoint IPs may be sent to [Country.is](https://country.is/) to infer flags. The API cannot identify the active interface; VPNs, proxies, and multiple endpoints can affect results. Flags do not guarantee physical location.
+
+Scheduled checks save status and process alerts before looking up flags. Results are cached for seven days, with a six-hour retry delay after failures. Alerts do not wait for flags. Stable checks add no recurring D1 writes; additional writes occur only when the country cache needs updating.
 
 Do not commit or publish settings, credentials, database exports, backups, or logs. Check Git's tracked files and redact secrets and private identifiers when seeking help. Avoid terminal recording or screen sharing while entering secrets.
 

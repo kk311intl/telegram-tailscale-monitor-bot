@@ -35,7 +35,7 @@ test("configured tags are excluded and opt-in GeoIP work is bounded", () => {
   assert.match(source, /const GEOIP_CACHE_SECONDS = 7 \* 86400/);
   assert.match(source, /const GEOIP_RETRY_SECONDS = 6 \* 3600/);
   assert.match(source, /const GEOIP_LOOKUPS_PER_SYNC = 5/);
-  assert.match(source, /candidates\.slice\(0, GEOIP_LOOKUPS_PER_SYNC\)/);
+  assert.match(source, /\.slice\(0, GEOIP_LOOKUPS_PER_SYNC\)/);
   assert.match(source, /GeoIP lookup failed/);
   assert.match(source, /s\.enabled = 1/);
 });

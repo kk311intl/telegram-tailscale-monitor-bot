@@ -9,7 +9,7 @@ let source = readFileSync(new URL('../src/index.js', import.meta.url), 'utf8');
 for (const file of ['helpers.js', 'i18n.js', 'update-lifecycle.js', 'api-runtime.js']) {
   source = source.replace(JSON.stringify('./' + file), JSON.stringify(new URL('../src/' + file, import.meta.url).href));
 }
-source += '\nexport {editOrSend, enrichDeviceCountries, dashboardView, deviceListView, deviceDetailView, drainNotificationOutbox, sendStatusNotification, truncate, markDeliverySent, recordDeliveryFailure};';
+source += '\nexport {editOrSend, enrichDeviceCountries, refreshDeviceCountries, dashboardView, deviceListView, deviceDetailView, drainNotificationOutbox, sendStatusNotification, truncate, markDeliverySent, recordDeliveryFailure};\n//# sourceURL=runtime-under-test.js';
 const app = await import('data:text/javascript;base64,' + Buffer.from(source).toString('base64'));
 const now = () => Math.floor(Date.now() / 1000);
 const response = (data, status = 200, headers = {}) => new Response(JSON.stringify(data), { status, headers });
@@ -100,7 +100,7 @@ test('overview and list retain their distinct out-of-range page fallbacks', asyn
   const overview = await app.dashboardView(env, '', 99);
   const list = await app.deviceListView(env, 99);
   assert.match(overview.text, /1\/3/);
-  assert.ok(overview.reply_markup.inline_keyboard.flat().some(button => button.callback_data === 'home:0'));
+  assert.ok(overview.reply_markup.inline_keyboard.flat().some(button => button.callback_data === 'refresh:0'));
   assert.ok(list.reply_markup.inline_keyboard.flat().some(button => button.text === '3/3' && button.callback_data === 'list:2'));
   for (const page of [0, 1, 2]) {
     const view = await app.deviceListView(env, page);
@@ -352,7 +352,7 @@ test('message and button refresh render the same dashboard', async t => {
   };
   await app.processUpdate({ message: { from: { id: 1 }, chat: { id: 1, type: 'private' }, text: '/status' } }, env);
   await app.processUpdate({ callback_query: {
-    id: 'query', from: { id: 1 }, data: 'home',
+    id: 'query', from: { id: 1 }, data: 'refresh:0',
     message: { chat: { id: 1, type: 'private' }, message_id: 10 }
   } }, env);
   assert.equal(sent.find(call => call.method === 'sendMessage').body.text,
@@ -375,7 +375,7 @@ test('dashboard shows ten devices per page and keeps refresh on the selected pag
   assert.match(first.text, /node010/);
   assert.doesNotMatch(second.text, /node021/);
   assert.equal(first.reply_markup.inline_keyboard[1].at(-1).callback_data, 'page:1');
-  assert.equal(second.reply_markup.inline_keyboard[0][1].callback_data, 'home:1');
+  assert.equal(second.reply_markup.inline_keyboard[0][1].callback_data, 'refresh:1');
   for (let page = 0; page < 12; page++) assert.ok((await app.dashboardView(env, '', page)).text.length < 4096);
 
   const sent = [];
@@ -392,11 +392,16 @@ test('dashboard shows ten devices per page and keeps refresh on the selected pag
   assert.equal(sent.find(call => call.method === 'editMessageText').body.text, second.text);
   assert.equal(calls.filter(url => url.includes('/devices?')).length, apiCallsBeforePaging);
   await app.processUpdate({ callback_query: {
-    id: 'refresh-page', from: { id: 1 }, data: 'home:1',
+    id: 'refresh-page', from: { id: 1 }, data: 'refresh:1',
     message: { chat: { id: 1, type: 'private' }, message_id: 10 }
   } }, env);
   assert.equal(sent.filter(call => call.method === 'editMessageText').at(-1).body.text, second.text);
   assert.equal(calls.filter(url => url.includes('/devices?')).length, apiCallsBeforePaging + 1);
+  await app.processUpdate({ callback_query: {
+    id: 'legacy-refresh', from: { id: 1 }, data: 'home:1',
+    message: { chat: { id: 1, type: 'private' }, message_id: 10 }
+  } }, env);
+  assert.equal(calls.filter(url => url.includes('/devices?')).length, apiCallsBeforePaging + 2);
 });
 
 test('messages and callbacks reject other owners and non-owner chats', async t => {
@@ -808,7 +813,7 @@ test('GeoIP is opt-in and the title is escaped', async t => {
   globalThis.fetch = async (url, init) => String(url).includes('country.is')
     ? response({ country: 'JP' })
     : previousFetch(url, init);
-  await app.syncTailscaleDevices(env, false);
+  await app.runScheduledChecks({}, env);
   assert.equal(JSON.parse(db.prepare('SELECT last_results FROM servers').get().last_results)[0].country, 'JP');
   env.GEOIP_ENABLED = 'false';
   await app.syncTailscaleDevices(env, false);
@@ -841,7 +846,7 @@ test('stalled response body respects deadline', async () => {
 test('stale GeoIP failure retries in six hours while keeping prior country', async () => {
   const checkedAt = now();
   const previous = { publicIp: '8.8.8.8', country: 'JP', countryCheckedAt: checkedAt - 8 * 86400 };
-  const [device] = await app.enrichDeviceCountries([{ id: 'n', publicIp: previous.publicIp }], new Map([['n', { last_results: JSON.stringify([previous]) }]]), checkedAt, async () => response({}, 429));
+  const [device] = await app.enrichDeviceCountries([{ id: 'n', ...previous }], checkedAt, async () => response({}, 429));
   assert.equal(device.country, 'JP');
   assert.equal(device.countryCheckedAt, previous.countryCheckedAt);
   assert.equal(device.countryRetryAt, checkedAt + 6 * 3600);
@@ -858,7 +863,7 @@ test('sync failure does not stop pending delivery with fresh visibility, stale v
   db.prepare("INSERT INTO notification_outbox(server_id,check_token,event,payload,created_at) VALUES (1,'q','down',?,1)").run(JSON.stringify({ id: 1, name: 'node', device: {}, event: 'down', eventTime: 1 }));
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async (url, init) => String(url).includes('/devices?') ? response({}, 503) : originalFetch(url, init);
-  await app.runScheduledChecks({}, env);
+  await assert.rejects(app.runScheduledChecks({}, env), /HTTP 503/);
   assert.ok(db.prepare('SELECT sent_at FROM notification_outbox').get().sent_at > 0);
   db.exec("UPDATE runtime_state SET until_at = 1 WHERE key = 'visibility'");
   const view = await app.dashboardView(env);
@@ -1010,4 +1015,207 @@ test('expired visibility prevents notification delivery during upstream outage',
   await app.drainNotificationOutbox(env, 5);
   assert.equal(calls, 0);
   assert.equal(db.prepare('SELECT attempts FROM notification_outbox').get().attempts, 0);
+});
+
+test('returning home uses cached data without sync writes or background work', async t => {
+  const { db, env, calls } = setup(t);
+  await app.syncTailscaleDevices(env, false);
+  calls.length = 0;
+  const saved = db.prepare('SELECT * FROM servers').all();
+  const before = db.prepare('SELECT total_changes() AS n').get().n;
+  await app.processUpdate({ callback_query: {
+    id: 'back', from: { id: 1 }, data: 'home',
+    message: { chat: { id: 1, type: 'private' }, message_id: 10 }
+  } }, env, { waitUntil() { assert.fail('Cached navigation must not start background work'); } });
+  assert.deepEqual(calls.map(url => url.split('/').at(-1)), ['answerCallbackQuery', 'editMessageText']);
+  assert.equal(db.prepare('SELECT total_changes() AS n').get().n - before, 6);
+  assert.deepEqual(db.prepare('SELECT * FROM servers').all(), saved);
+});
+
+test('manual refresh replies before background delivery and completed webhook retries cannot resend', async t => {
+  const { db, env, devices } = setup(t);
+  let clock = Date.now();
+  t.mock.method(Date, 'now', () => clock);
+  env.WEBHOOK_SECRET = 'test-secret';
+  await app.syncTailscaleDevices(env, false);
+  devices[0].connectedToControl = false;
+  await app.syncTailscaleDevices(env, true);
+  clock += 60000;
+  const fetchImpl = globalThis.fetch;
+  const messages = [];
+  let allowDelivery;
+  const gate = new Promise(resolve => { allowDelivery = resolve; });
+  const jobs = [];
+  const scheduler = new app.StatusScheduler({ waitUntil(job) { jobs.push(job); } }, env);
+  let requests = 0;
+  env.SCHEDULER = { getByName(name) {
+    assert.equal(name, 'monitor');
+    return { async fetch(url, init) {
+      requests++;
+      await gate;
+      return scheduler.fetch(new Request(url, init));
+    } };
+  } };
+  globalThis.fetch = async (url, init) => {
+    if (String(url).includes('api.telegram.org')) messages.push(JSON.parse(init.body).text);
+    return fetchImpl(url, init);
+  };
+  const update = { update_id: 2000, message: { from: { id: 1 }, chat: { id: 1, type: 'private' }, text: '/status' } };
+  const request = () => new Request('https://test.invalid/webhook', { method: 'POST',
+    headers: { 'X-Telegram-Bot-Api-Secret-Token': env.WEBHOOK_SECRET }, body: JSON.stringify(update) });
+  const pending = [];
+  const ctx = { waitUntil(job) { pending.push(job); } };
+  assert.equal((await app.default.fetch(request(), env, ctx)).status, 200);
+  assert.equal(requests, 1);
+  assert.equal(messages.length, 1);
+  assert.doesNotMatch(messages[0], /<b>設備離線<\/b>/);
+  assert.equal(db.prepare('SELECT sent_at FROM notification_outbox').get().sent_at, 0);
+  assert.equal(db.prepare('SELECT status FROM processed_updates WHERE update_id=2000').get().status, 'done');
+  allowDelivery();
+  await Promise.all(pending);
+  await Promise.all(jobs);
+  assert.equal(messages.length, 2);
+  assert.match(messages[1], /設備離線/);
+  assert.ok(db.prepare('SELECT sent_at FROM notification_outbox').get().sent_at > 0);
+  assert.equal((await app.default.fetch(request(), env, ctx)).status, 200);
+  assert.equal(requests, 1);
+  assert.equal(messages.length, 2);
+  await app.processUpdate({ ...update, message: { ...update.message } }, env, ctx);
+  assert.equal(requests, 1, 'An unchanged manual refresh needs no extra scheduler request');
+});
+
+test('scheduled sync distinguishes cooldown and busy skips from failures without counting offline', async t => {
+  const { db, env, calls } = setup(t);
+  await app.syncTailscaleDevices(env, false);
+  const saved = db.prepare('SELECT * FROM servers').all();
+  db.prepare("INSERT INTO runtime_state(key,until_at) VALUES('tailscale',?)").run(now() + 180);
+  calls.length = 0;
+  assert.deepEqual(await app.runScheduledChecks({}, env), { sync: 'skipped' });
+  assert.equal(calls.length, 0);
+  db.exec("DELETE FROM runtime_state WHERE key='tailscale'");
+  db.prepare("UPDATE runtime_state SET token='held',until_at=? WHERE key='sync'").run(now() + 120);
+  assert.deepEqual(await app.runScheduledChecks({}, env), { sync: 'skipped' });
+  assert.equal(calls.length, 0);
+  db.exec("UPDATE runtime_state SET until_at=0 WHERE key='sync'");
+  globalThis.fetch = async () => response({}, 429, { 'retry-after': '180' });
+  assert.deepEqual(await app.runScheduledChecks({}, env), { sync: 'skipped' });
+  db.exec("DELETE FROM runtime_state WHERE key='tailscale'");
+  globalThis.fetch = async () => response({}, 503);
+  const scheduler = new app.StatusScheduler({}, env);
+  await assert.rejects(scheduler.fetch(new Request('https://scheduler/checks', { method: 'POST',
+    body: JSON.stringify({ scheduledTime: Date.now() }) })), /HTTP 503/);
+  assert.deepEqual(db.prepare('SELECT * FROM servers').all(), saved);
+  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM status_events').get().n, 0);
+});
+
+test('notifications precede slow GeoIP and late results cannot replace a newer endpoint or status', async t => {
+  const { db, env, devices } = setup(t);
+  let clock = Date.now();
+  t.mock.method(Date, 'now', () => clock);
+  env.GEOIP_ENABLED = 'true';
+  devices[0].clientConnectivity = { endpoints: ['8.8.8.8:41641'] };
+  await app.syncTailscaleDevices(env, false);
+  devices[0].connectedToControl = false;
+  await app.syncTailscaleDevices(env, true);
+  clock += 60000;
+  const fetchImpl = globalThis.fetch;
+  let countryStarted;
+  let countryReady;
+  const started = new Promise(resolve => { countryStarted = resolve; });
+  const country = new Promise(resolve => { countryReady = resolve; });
+  globalThis.fetch = async (url, init) => {
+    if (!String(url).includes('country.is')) return fetchImpl(url, init);
+    countryStarted();
+    return country;
+  };
+  const run = app.runScheduledChecks({}, env);
+  await started;
+  assert.equal(db.prepare('SELECT status FROM servers').get().status, 'down');
+  assert.ok(db.prepare('SELECT sent_at FROM notification_outbox').get().sent_at > 0);
+  assert.equal(db.prepare("SELECT until_at FROM runtime_state WHERE key='sync'").get().until_at, 0);
+  devices[0].connectedToControl = true;
+  devices[0].clientConnectivity.endpoints = ['1.1.1.1:41641'];
+  await app.syncTailscaleDevices(env, true);
+  countryReady(response({ country: 'JP' }));
+  await run;
+  const row = db.prepare('SELECT * FROM servers').get();
+  const metadata = JSON.parse(row.last_results)[0];
+  assert.equal(row.status, 'up');
+  assert.equal(metadata.publicIp, '1.1.1.1');
+  assert.equal(metadata.country, '');
+  assert.deepEqual(db.prepare('SELECT event FROM notification_outbox ORDER BY id').all().map(row => row.event), ['down', 'recovered']);
+});
+
+test('cached countries add no writes or lookups to healthy scheduled polls', async t => {
+  const { db, env, devices } = setup(t);
+  let clock = Date.now();
+  t.mock.method(Date, 'now', () => clock);
+  env.GEOIP_ENABLED = 'true';
+  devices[0].clientConnectivity = { endpoints: ['8.8.8.8:41641'] };
+  const fetchImpl = globalThis.fetch;
+  let lookups = 0;
+  globalThis.fetch = async (url, init) => {
+    if (!String(url).includes('country.is')) return fetchImpl(url, init);
+    lookups++;
+    return response({ country: 'JP' });
+  };
+  await app.runScheduledChecks({}, env);
+  const saved = db.prepare('SELECT * FROM servers').all();
+  for (let minute = 0; minute < 4; minute++) {
+    clock += 60000;
+    devices[0].lastSeen = new Date(clock).toISOString();
+    const before = db.prepare('SELECT total_changes() AS n').get().n;
+    await app.runScheduledChecks({}, env);
+    assert.equal(db.prepare('SELECT total_changes() AS n').get().n - before, 3);
+    assert.deepEqual(db.prepare('SELECT * FROM servers').all(), saved);
+  }
+  assert.equal(lookups, 1);
+});
+
+test('late GeoIP results are fenced and cannot restore hidden devices', async t => {
+  const { db, env, devices } = setup(t);
+  env.GEOIP_ENABLED = 'true';
+  devices[0].clientConnectivity = { endpoints: ['8.8.8.8:41641'] };
+  const result = await app.syncTailscaleDevices(env, false);
+  globalThis.fetch = async () => { db.exec('UPDATE servers SET enabled=0'); return response({ country: 'JP' }); };
+  await app.refreshDeviceCountries(result.devices, env);
+  assert.equal(db.prepare('SELECT enabled FROM servers').get().enabled, 0);
+  assert.equal(JSON.parse(db.prepare('SELECT last_results FROM servers').get().last_results)[0].country, '');
+  db.exec('UPDATE servers SET enabled=1');
+  const batch = env.STATUS_DB.batch;
+  env.STATUS_DB.batch = async statements => {
+    db.prepare("UPDATE runtime_state SET token='replacement',until_at=? WHERE key='sync'").run(now() + 120);
+    return batch(statements);
+  };
+  globalThis.fetch = async () => response({ country: 'JP' });
+  await app.refreshDeviceCountries(result.devices, env);
+  assert.equal(JSON.parse(db.prepare('SELECT last_results FROM servers').get().last_results)[0].country, '');
+  assert.equal(db.prepare("SELECT token FROM runtime_state WHERE key='sync'").get().token, 'replacement');
+});
+
+test('GeoIP lookups are capped at five and failure cooldowns avoid repeated requests or writes', async t => {
+  const { db, env, devices } = setup(t);
+  let clock = Date.now();
+  t.mock.method(Date, 'now', () => clock);
+  env.GEOIP_ENABLED = 'true';
+  devices.splice(0, devices.length, ...Array.from({ length: 8 }, (_, i) => ({ id: `geo-${i}`,
+    name: `geo-${i}`, connectedToControl: true, clientConnectivity: { endpoints: [`8.8.8.${i + 1}:41641`] } })));
+  const fetchImpl = globalThis.fetch;
+  let lookups = 0;
+  globalThis.fetch = async (url, init) => {
+    if (!String(url).includes('country.is')) return fetchImpl(url, init);
+    lookups++;
+    return response({}, 503);
+  };
+  await app.runScheduledChecks({}, env);
+  assert.equal(lookups, 5);
+  clock += 60000;
+  await app.runScheduledChecks({}, env);
+  assert.equal(lookups, 8);
+  clock += 60000;
+  const before = db.prepare('SELECT total_changes() AS n').get().n;
+  await app.runScheduledChecks({}, env);
+  assert.equal(lookups, 8);
+  assert.equal(db.prepare('SELECT total_changes() AS n').get().n - before, 3);
+  assert.ok(db.prepare('SELECT last_results FROM servers').all().every(row => JSON.parse(row.last_results)[0].countryRetryAt > now() + 5 * 3600));
 });

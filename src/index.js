@@ -26,7 +26,7 @@ const GEOIP_LOOKUPS_PER_SYNC = 5;
 let oauthCache = { clientId: "", token: "", expiresAt: 0 };
 
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     const url = new URL(request.url);
     if (request.method === "GET" && url.pathname === "/health") {
       return json({ ok: true, service: env.HEALTH_SERVICE || "tailscale-server-monitor", monitor: "tailscale-api" });
@@ -60,7 +60,7 @@ export default {
       return json({ ok: false, retry: true }, { status: 503, headers: { "retry-after": "2" } });
     }
     try {
-      await processUpdate(update, env);
+      await processUpdate(update, env, ctx);
       await completeUpdate(env.STATUS_DB, updateContext);
       return json({ ok: true });
     } catch (error) {
@@ -85,27 +85,40 @@ export default {
 };
 
 export class StatusScheduler {
-  constructor(ctx, env) { this.env = env; }
+  constructor(ctx, env) { this.ctx = ctx; this.env = env; }
 
   async fetch(request) {
     if (request.method !== "POST") return new Response("Method not allowed", { status: 405 });
+    const path = new URL(request.url).pathname;
+    if (path === "/notifications") {
+      this.ctx.waitUntil(drainNotificationOutbox(this.env, 5));
+      return json({ ok: true });
+    }
+    if (path !== "/checks") return new Response("Not found", { status: 404 });
     let event;
     try { event = await request.json(); }
     catch { return new Response("Bad request", { status: 400 }); }
     if (!Number.isSafeInteger(event?.scheduledTime) || event.scheduledTime < 0) {
       return new Response("Bad request", { status: 400 });
     }
-    await runScheduledChecks(event, this.env);
-    return json({ ok: true });
+    return json({ ok: true, ...(await runScheduledChecks(event, this.env)) });
   }
 }
 
-export async function processUpdate(update, env) {
-  if (update.callback_query) return processCallback(update.callback_query, env);
-  if (update.message) return processMessage(update.message, env);
+export async function processUpdate(update, env, ctx) {
+  const work = { queued: false };
+  if (update.callback_query) await processCallback(update.callback_query, env, work);
+  else if (update.message) await processMessage(update.message, env, work);
+  if (!work.queued) return;
+  if (!ctx?.waitUntil) return drainNotificationOutbox(env, 5);
+  ctx.waitUntil(env.SCHEDULER.getByName("monitor").fetch("https://scheduler/notifications", {
+    method: "POST"
+  }).then(response => {
+    if (!response.ok) throw new Error(`Notification delivery failed: HTTP ${response.status}`);
+  }));
 }
 
-async function processMessage(message, env) {
+async function processMessage(message, env, work) {
   if (!message?.from || message.from.is_bot || !Number.isSafeInteger(message.chat?.id) || message.chat.id === 0) return;
   if (String(message.from.id) !== String(env.ADMIN_USER_ID)) return;
   if (message.chat?.type !== "private") {
@@ -120,7 +133,7 @@ async function processMessage(message, env) {
     ...(await dashboardView(env))
   });
   if (command === "status") return telegram(env, "sendMessage", {
-    chat_id: message.chat.id, ...(await refreshDashboard(env))
+    chat_id: message.chat.id, ...(await refreshDashboard(env, 0, work))
   });
   if (command === "list") return sendDeviceList(message.chat.id, env, 0);
   const match = text.match(/^\/device(?:@[A-Za-z0-9_]+)?\s+(\d+)$/i);
@@ -132,7 +145,7 @@ async function processMessage(message, env) {
   });
 }
 
-async function processCallback(query, env) {
+async function processCallback(query, env, work) {
   if (typeof query?.id !== "string" || !query.id) return;
   const privateOwnerChat = query?.message?.chat?.type === "private" &&
     String(query.message.chat.id) === String(env.ADMIN_USER_ID);
@@ -148,21 +161,29 @@ async function processCallback(query, env) {
   const chatId = query.message.chat.id;
   const messageId = query.message.message_id;
   const [action, rawId = "", rawPage = ""] = String(query.data || "").split(":");
-  if (action === "home") return editOrSend(chatId, messageId, await refreshDashboard(env, Number(rawId || 0)), env);
+  if (action === "home" && rawId === "") return editOrSend(chatId, messageId, await dashboardView(env), env);
+  // Keep refresh buttons in older messages working; new navigation uses plain "home".
+  if (action === "refresh" || action === "home") return editOrSend(chatId, messageId, await refreshDashboard(env, Number(rawId || 0), work), env);
   if (action === "page") return editOrSend(chatId, messageId, await dashboardView(env, "", Number(rawId || 0)), env);
   if (action === "list") return editDeviceList(chatId, messageId, env, Number(rawId || 0));
   if (action === "detail") return editDeviceDetail(chatId, messageId, env, Number(rawId), Number(rawPage || 0));
   if (action === "check") {
     const id = Number(rawId);
-    const warning = await syncWarning(env);
-    await drainNotificationOutbox(env, 5);
+    const warning = await syncWarning(env, work);
     return editDeviceDetail(chatId, messageId, env, id, Number(rawPage || 0), warning);
   }
 }
 
 export async function runScheduledChecks(event, env) {
-  await syncWarning(env);
+  let sync;
+  let syncError;
+  try { sync = await syncTailscaleDevices(env, true); }
+  catch (error) {
+    if (["SYNC_BUSY", "API_COOLDOWN"].includes(error.code)) console.info("Tailscale sync skipped", error.code);
+    else { syncError = error; console.error("Tailscale sync failed", safeError(error)); }
+  }
   await drainNotificationOutbox(env, 5);
+  if (sync) await refreshDeviceCountries(sync.devices, env);
   const scheduledSeconds = Math.floor(Number(event?.scheduledTime || Date.now()) / 1000);
   if (Math.floor(scheduledSeconds / 60) % 60 === 17) {
     await env.STATUS_DB.batch([
@@ -178,6 +199,8 @@ export async function runScheduledChecks(event, env) {
       `).bind(scheduledSeconds - 90 * 86400)
     ]);
   }
+  if (syncError) throw syncError;
+  return { sync: sync ? "ok" : "skipped" };
 }
 
 export async function fetchTailscaleDevices(env, fetchImpl = fetch) {
@@ -223,13 +246,14 @@ async function tailscaleJson(env, fetchImpl, url, init, label) {
     const state = env.STATUS_DB ? await readState(env.STATUS_DB, 'tailscale') : {};
     const fallback = Math.min(900, 60 * 2 ** Math.min(Number(state.failures || 0), 4)) + Math.floor(Math.random() * 15);
     await setCooldown(env.STATUS_DB, 'tailscale', retrySeconds(result.response.headers.get('retry-after'), fallback));
+    throw Object.assign(new Error(`${label}: HTTP 429`), { code: "API_COOLDOWN" });
   }
   return result;
 }
 
 export async function syncTailscaleDevices(env, notify) {
   const lease = await acquireLease(env.STATUS_DB, 'sync', 120);
-  if (!lease) throw new Error('設備正在同步，請稍後更新');
+  if (!lease) throw Object.assign(new Error('設備正在同步，請稍後更新'), { code: "SYNC_BUSY" });
   try {
   const fetchedDevices = await fetchTailscaleDevices(env);
   const checkedAt = nowSeconds();
@@ -241,15 +265,18 @@ export async function syncTailscaleDevices(env, notify) {
   const previousSeen = parseLastSeenSnapshot((await readState(env.STATUS_DB, 'visibility')).token);
   const hiddenTags = new Set(String(env.HIDDEN_TAGS || "").split(",").map((tag) => tag.trim().toLowerCase()).filter(Boolean));
   const visibleDevices = fetchedDevices.filter((device) => !hasHiddenTag(device, hiddenTags));
-  const devices = env.GEOIP_ENABLED === "true"
-    ? await enrichDeviceCountries(visibleDevices, existingById, checkedAt)
-    : visibleDevices.map((device) => ({ ...device, country: "" }));
+  const devices = visibleDevices.map(device => env.GEOIP_ENABLED === "true"
+    ? cachedDeviceCountry(device, parseDevice(existingById.get(device.id)?.last_results))
+    : { ...device, country: "" });
   const visibleIds = new Set(devices.map(device => device.id));
   const statements = [];
+  let queued = false;
   const fence = "EXISTS (SELECT 1 FROM runtime_state WHERE key = 'sync' AND token = ? AND until_at > unixepoch())";
   for (const device of devices) {
     const existing = existingById.get(device.id);
-    statements.push(...persistTailscaleDevice(device, checkedAt, syncToken, env, notify, existing, lease, previousSeen.get(device.id)));
+    const saved = persistTailscaleDevice(device, checkedAt, syncToken, env, notify, existing, lease, previousSeen.get(device.id));
+    statements.push(...saved.statements);
+    queued ||= saved.queued;
   }
   for (const row of existingQuery.results || []) {
     if (Number(row.enabled) === 1 && !visibleIds.has(String(row.host))) {
@@ -275,27 +302,46 @@ export async function syncTailscaleDevices(env, notify) {
   }
   if (Number(results.at(-1)?.meta?.changes) !== 1) throw new Error('同步已逾時，未套用設備資料');
   await env.STATUS_DB.prepare("UPDATE runtime_state SET failures = 0, until_at = 0 WHERE key = 'tailscale' AND (failures != 0 OR until_at != 0)").run();
-  return devices.length;
+  return { devices, queued };
   } finally { await releaseLease(env.STATUS_DB, 'sync', lease); }
 }
 
-async function enrichDeviceCountries(devices, existingById, checkedAt, fetchImpl = fetch) {
-  const candidates = [];
-  const enriched = devices.map((device) => {
-    const previous = parseDevice(existingById.get(device.id)?.last_results);
-    const samePublicIp = Boolean(device.publicIp && device.publicIp === previous.publicIp);
-    const cachedCountry = samePublicIp && /^[A-Z]{2}$/.test(String(previous.country || "").toUpperCase())
-      ? String(previous.country).toUpperCase()
-      : "";
-    const countryCheckedAt = samePublicIp ? Number(previous.countryCheckedAt || 0) : 0;
-    const countryRetryAt = samePublicIp ? Number(previous.countryRetryAt || 0) : 0;
-    const next = { ...device, country: cachedCountry, countryCheckedAt, countryRetryAt };
-    if (device.publicIp && checkedAt >= countryRetryAt && (!cachedCountry || checkedAt - countryCheckedAt >= GEOIP_CACHE_SECONDS)) {
-      candidates.push(next);
-    }
-    return next;
-  });
-  await Promise.all(candidates.slice(0, GEOIP_LOOKUPS_PER_SYNC).map(async (device) => {
+function cachedDeviceCountry(device, previous) {
+  const samePublicIp = Boolean(device.publicIp && device.publicIp === previous.publicIp);
+  return { ...device,
+    country: samePublicIp && /^[A-Z]{2}$/.test(String(previous.country || "").toUpperCase()) ? String(previous.country).toUpperCase() : "",
+    countryCheckedAt: samePublicIp ? Number(previous.countryCheckedAt || 0) : 0,
+    countryRetryAt: samePublicIp ? Number(previous.countryRetryAt || 0) : 0
+  };
+}
+
+async function refreshDeviceCountries(devices, env) {
+  if (env.GEOIP_ENABLED !== "true") return;
+  const checkedAt = nowSeconds();
+  const candidates = devices.filter(device => device.publicIp && checkedAt >= device.countryRetryAt &&
+    (!device.country || checkedAt - device.countryCheckedAt >= GEOIP_CACHE_SECONDS)).slice(0, GEOIP_LOOKUPS_PER_SYNC);
+  if (!candidates.length) return;
+  const enriched = await enrichDeviceCountries(candidates, checkedAt);
+  const lease = await acquireLease(env.STATUS_DB, 'sync', 30);
+  if (!lease) return;
+  try {
+    await env.STATUS_DB.batch(enriched.map((device, index) => env.STATUS_DB.prepare(`
+      UPDATE servers SET last_results = json_set(last_results,
+        '$[0].country', ?, '$[0].countryCheckedAt', ?, '$[0].countryRetryAt', ?),
+        revision = revision + 1, updated_at = ?
+      WHERE host = ? AND ports = 'tailscale' AND enabled = 1
+        AND json_extract(last_results, '$[0].publicIp') = ?
+        AND COALESCE(json_extract(last_results, '$[0].countryCheckedAt'), 0) = ?
+        AND COALESCE(json_extract(last_results, '$[0].countryRetryAt'), 0) = ?
+        AND EXISTS (SELECT 1 FROM runtime_state WHERE key = 'sync' AND token = ? AND until_at > unixepoch())
+    `).bind(device.country, device.countryCheckedAt, device.countryRetryAt, checkedAt, device.id,
+      device.publicIp, candidates[index].countryCheckedAt, candidates[index].countryRetryAt, lease)));
+  } finally { await releaseLease(env.STATUS_DB, 'sync', lease); }
+}
+
+async function enrichDeviceCountries(devices, checkedAt, fetchImpl = fetch) {
+  const enriched = devices.map(device => ({ ...device }));
+  await Promise.all(enriched.map(async (device) => {
     try {
       const { response, data } = await requestJson(
         fetchImpl,
@@ -336,9 +382,9 @@ function persistTailscaleDevice(device, checkedAt, syncToken, env, notify, exist
       existing.status === observation.status && !existing.last_error &&
       Number(existing.consecutive_failures || 0) === observation.failures &&
       Number(existing.consecutive_successes || 0) === observation.successes &&
-      stableDeviceMetadata(previousDevice) === stableDeviceMetadata(device)) return [];
+      stableDeviceMetadata(previousDevice) === stableDeviceMetadata(device)) return { statements: [], queued: false };
   if (!existing) {
-    return [env.STATUS_DB.prepare(`
+    return { queued: false, statements: [env.STATUS_DB.prepare(`
       INSERT INTO servers(
         name, host, ports, enabled, status, consecutive_failures, consecutive_successes,
         last_checked_at, last_changed_at, last_results, last_error,
@@ -348,7 +394,7 @@ function persistTailscaleDevice(device, checkedAt, syncToken, env, notify, exist
     `).bind(
       device.displayName, device.id, observation.status, observation.failures, observation.successes,
       checkedAt, metadata, syncToken, checkedAt, checkedAt, lease
-    )];
+    )] };
   }
   const checkToken = `${syncToken}:${existing.id}`;
   const statements = [env.STATUS_DB.prepare(`
@@ -380,7 +426,7 @@ function persistTailscaleDevice(device, checkedAt, syncToken, env, notify, exist
       }), checkedAt, checkedAt, existing.id, syncToken));
     }
   }
-  return statements;
+  return { statements, queued: Boolean(observation.event && notify && env.BOT_TOKEN && env.ADMIN_USER_ID) };
 }
 
 async function drainNotificationOutbox(env, limit) {
@@ -473,9 +519,10 @@ async function sendStatusNotification(payload, env, visibilityLease) {
 }
 
 
-async function syncWarning(env) {
+async function syncWarning(env, work) {
   try {
-    await syncTailscaleDevices(env, true);
+    const result = await syncTailscaleDevices(env, true);
+    if (work) work.queued ||= result.queued;
     return "";
   } catch (error) {
     console.error("Tailscale sync failed", safeError(error));
@@ -483,9 +530,8 @@ async function syncWarning(env) {
   }
 }
 
-async function refreshDashboard(env, page = 0) {
-  const warning = await syncWarning(env);
-  await drainNotificationOutbox(env, 5);
+async function refreshDashboard(env, page = 0, work) {
+  const warning = await syncWarning(env, work);
   return dashboardView(env, warning, page);
 }
 
@@ -549,7 +595,7 @@ function pageNavigation(env, page, pages, action) {
 function mainKeyboard(env, page = 0, pages = 1) {
   const buttons = [[
     { text: `📋 ${t(env.BOT_LANGUAGE, "deviceList")}`, callback_data: "list:0" },
-    { text: `🔄 ${t(env.BOT_LANGUAGE, "refresh")}`, callback_data: `home:${page}` }
+    { text: `🔄 ${t(env.BOT_LANGUAGE, "refresh")}`, callback_data: `refresh:${page}` }
   ]];
   if (pages > 1) buttons.push(pageNavigation(env, page, pages, 'page'));
   return { inline_keyboard: buttons };

@@ -47,7 +47,7 @@ test('API body reader and redirect guard work in the native Workers runtime', as
   } finally { await mf.dispose(); }
 });
 
-test('native D1 preserves offline and recovery notifications after stable polls skip device writes', async () => {
+test('native D1 preserves status notifications and cached flags after stable polls skip device writes', async () => {
   const require = createRequire(import.meta.url);
   const dependencies = [require.resolve('wrangler/package.json')];
   const { Miniflare, convertV4MiniflareOptions } = await import(pathToFileURL(require.resolve('miniflare', { paths: dependencies })));
@@ -57,26 +57,31 @@ test('native D1 preserves offline and recovery notifications after stable polls 
     contents: readFileSync(new URL('../src/' + file, import.meta.url), 'utf8') +
       (file === 'index.js' ? '\nexport {drainNotificationOutbox};' : '')
   }));
-  const worker = `import {syncTailscaleDevices, drainNotificationOutbox} from './index.js';
+  const worker = `import {runScheduledChecks} from './index.js';
+    export {StatusScheduler} from './index.js';
     let clock = Date.now();
     Date.now = () => clock;
     export default { async fetch(request, env) {
+      if (new URL(request.url).pathname === '/drain') {
+        return env.SCHEDULER.getByName('monitor').fetch('https://scheduler/notifications', {method:'POST'});
+      }
       clock = (await request.json()).now * 1000;
-      await syncTailscaleDevices(env, true);
-      await drainNotificationOutbox(env, 5);
+      await runScheduledChecks({}, env);
       return Response.json({ok:true});
     } };`;
-  const device = { id: 'native-test', name: 'test.example.ts.net', connectedToControl: true, tags: [] };
+  const device = { id: 'native-test', name: 'test.example.ts.net', connectedToControl: true, tags: [], clientConnectivity: { endpoints: ['8.8.8.8:41641'] } };
   const sent = [];
   const mf = new Miniflare(convertV4MiniflareOptions({
     cf: false,
     compatibilityDate: '2026-09-01',
     modules: [{ type: 'ESModule', path: fileURLToPath(new URL('../src/native-status-test.js', import.meta.url)), contents: worker }, ...modules],
     d1Databases: { STATUS_DB: 'native-status-test' },
-    bindings: { BOT_TOKEN: 'fake', ADMIN_USER_ID: '1', TAILSCALE_CLIENT_ID: 'native-test', TAILSCALE_CLIENT_SECRET: 'fake', OFFLINE_AFTER: '2' },
+    durableObjects: { SCHEDULER: { className: 'StatusScheduler', useSQLite: true } },
+    bindings: { BOT_TOKEN: 'fake', ADMIN_USER_ID: '1', TAILSCALE_CLIENT_ID: 'native-test', TAILSCALE_CLIENT_SECRET: 'fake', OFFLINE_AFTER: '2', GEOIP_ENABLED: 'true' },
     outboundService: async request => {
       if (request.url.endsWith('/oauth/token')) return Response.json({ access_token: 'mock', expires_in: 3600 });
       if (request.url.includes('/devices?')) return Response.json({ devices: [device] });
+      if (request.url.startsWith('https://api.country.is/')) return Response.json({ country: 'JP' });
       assert.ok(request.url.startsWith('https://api.telegram.org/botfake/sendMessage'));
       sent.push(await request.json());
       return Response.json({ ok: true, result: { message_id: sent.length } });
@@ -98,6 +103,7 @@ test('native D1 preserves offline and recovery notifications after stable polls 
     };
     await poll(0);
     const original = await db.prepare('SELECT * FROM servers').first();
+    assert.equal(JSON.parse(original.last_results)[0].country, 'JP');
     for (let minute = 1; minute <= 5; minute++) {
       device.lastSeen = new Date((start + minute * 60) * 1000).toISOString();
       await poll(minute * 60);
@@ -126,5 +132,17 @@ test('native D1 preserves offline and recovery notifications after stable polls 
     assert.equal(sent.length, 2);
     assert.match(sent[0].text, /設備離線/);
     assert.match(sent[1].text, /設備恢復/);
+    await db.prepare(`INSERT INTO notification_outbox(server_id,check_token,event,payload,created_at)
+      VALUES(1,'native-background','down',?,1)`).bind(JSON.stringify({ id: 1, name: 'test',
+      device: {}, event: 'down', eventTime: 1 })).run();
+    assert.equal((await mf.dispatchFetch('https://worker.invalid/drain', {method:'POST'})).status, 200);
+    for (let attempt = 0; attempt < 50; attempt++) {
+      if ((await db.prepare("SELECT sent_at FROM notification_outbox WHERE check_token='native-background'").first()).sent_at > 0) break;
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+    assert.ok((await db.prepare("SELECT sent_at FROM notification_outbox WHERE check_token='native-background'").first()).sent_at > 0);
+    assert.equal(sent.length, 3);
+    assert.equal((await mf.dispatchFetch('https://worker.invalid/drain', {method:'POST'})).status, 200);
+    assert.equal(sent.length, 3);
   } finally { await mf.dispose(); }
 });

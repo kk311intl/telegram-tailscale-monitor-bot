@@ -62,6 +62,7 @@ export async function checkCooldown(db, key) {
   const state = await readState(db, key);
   if (state.until_at > nowSeconds()) {
     const error = new Error(`${key}: 冷卻中，請稍後重試`);
+    error.code = 'API_COOLDOWN';
     error.retryAfter = state.until_at - nowSeconds();
     error.telegramErrorCode = key === 'telegram' ? 429 : undefined;
     throw error;
