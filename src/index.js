@@ -570,22 +570,24 @@ async function refreshDashboard(env, page = 0, work) {
 async function dashboardView(env, warning = "", requestedPage = 0) {
   if (!(await visibilityFresh(env))) return unavailableView(env);
   const devices = await visibleDeviceRows(env);
-  const pages = Math.max(1, Math.ceil(devices.length / LIST_PAGE_SIZE));
+  // The overview lists offline devices only; the device list keeps every device.
+  const offline = devices.filter((item) => item.status === "down");
+  const pages = Math.max(1, Math.ceil(offline.length / LIST_PAGE_SIZE));
   const page = clampInteger(requestedPage, 0, pages - 1, 0);
-  const lines = devices.length
-    ? devices.slice(page * LIST_PAGE_SIZE, (page + 1) * LIST_PAGE_SIZE).map((row) => formatDashboardDevice(row, env))
-    : [t(env.BOT_LANGUAGE, "noDevices")];
+  const lines = offline.length
+    ? offline.slice(page * LIST_PAGE_SIZE, (page + 1) * LIST_PAGE_SIZE).map((row) => formatDashboardDevice(row, env))
+    : [t(env.BOT_LANGUAGE, devices.length ? "noOfflineDevices" : "noDevices")];
   return {
     text: [
       `<b>${escapeHtml(truncate(env.BOT_TITLE || t(env.BOT_LANGUAGE, "dashboardTitle"), 80))}</b>`,
       "",
       `🟢 ${t(env.BOT_LANGUAGE, "online")}${t(env.BOT_LANGUAGE, "colon")}${devices.filter((item) => item.status === "up").length}`,
-      `🔴 ${t(env.BOT_LANGUAGE, "offline")}${t(env.BOT_LANGUAGE, "colon")}${devices.filter((item) => item.status === "down").length}`,
+      `🔴 ${t(env.BOT_LANGUAGE, "offline")}${t(env.BOT_LANGUAGE, "colon")}${offline.length}`,
       `⚪ ${t(env.BOT_LANGUAGE, "pending")}${t(env.BOT_LANGUAGE, "colon")}${devices.filter((item) => item.status === "unknown").length}`,
       `📋 ${t(env.BOT_LANGUAGE, "total")}${t(env.BOT_LANGUAGE, "colon")}${devices.length}`,
       warning ? `\n⚠️ ${t(env.BOT_LANGUAGE, "syncFailed")}` : null,
       "",
-      `<b>${t(env.BOT_LANGUAGE, "allDevices")}</b>${pages > 1 ? ` · ${page + 1}/${pages}` : ""}`,
+      `<b>${t(env.BOT_LANGUAGE, "offlineDevices")}</b>${pages > 1 ? ` · ${page + 1}/${pages}` : ""}`,
       ...lines
     ].filter(line => line !== null).join("\n"),
     parse_mode: "HTML",

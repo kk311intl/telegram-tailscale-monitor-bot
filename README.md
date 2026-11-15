@@ -2,7 +2,7 @@
 
 [中文](#zh-tw) · [日本語](#ja) · [English](#en)
 
-`v1.5.0` · [GPL-3.0-only](LICENSE)
+`v1.5.1` · [GPL-3.0-only](LICENSE)
 
 <a id="zh-tw"></a>
 
@@ -78,7 +78,7 @@ Webhook 工具會隱藏輸入 Bot Token 與同一個 `WEBHOOK_SECRET`，並註�
 
 ### 使用與驗證
 
-僅管理者可在私聊操作：`/start` 查看最近設備資料、`/status` 更新總覽、`/list` 查看列表、`/device ID` 查看詳情、`/settings` 開啟設定。總覽與列表每頁 10 台；IP 不顯示，預設按 IP 排序，離線設備始終置頂。
+僅管理者可在私聊操作：`/start` 查看最近設備資料、`/status` 更新總覽、`/list` 查看列表、`/device ID` 查看詳情、`/settings` 開啟設定。總覽只列出離線設備，完整設備請看列表；兩者每頁 10 台。IP 不顯示，預設按 IP 排序，離線設備始終置頂。
 
 總覽的「⚙️ 設定」分為「↕️ 排序依據」與「🏷 標籤篩選」。排序可選 IP、名稱或國家（需開啟 GeoIP）；標籤篩選可點選標籤隱藏或顯示設備，變更後立即同步。設定只在修改時寫入一次 D1。
 
@@ -204,7 +204,7 @@ Webhook ツールで Bot Token と同じ `WEBHOOK_SECRET` を非表示で入力�
 
 ### 使い方と確認
 
-管理者だけが個人チャットで操作できます。`/start` は最近の端末データ、`/status` は概要を更新、`/list` は一覧、`/device ID` は詳細、`/settings` は設定を表示します。概要と一覧は 1 ページ 10 台です。IP は非表示で、既定では IP 順に並び、オフライン端末は常に先頭に表示されます。
+管理者だけが個人チャットで操作できます。`/start` は最近の端末データ、`/status` は概要を更新、`/list` は一覧、`/device ID` は詳細、`/settings` は設定を表示します。概要にはオフラインの端末だけを表示し、すべての端末は一覧で確認します。どちらも 1 ページ 10 台です。IP は非表示で、既定では IP 順に並び、オフライン端末は常に先頭に表示されます。
 
 概要の「⚙️ 設定」には「↕️ 並び順」と「🏷 タグの絞り込み」があります。並び順は IP、名前、国（GeoIP 有効時）から選べます。タグの絞り込みではタグを押して端末の非表示と表示を切り替え、変更はすぐ同期されます。設定は変更時だけ D1 に 1 回書き込みます。
 
@@ -329,7 +329,7 @@ The webhook tool securely prompts for the Bot Token and the same `WEBHOOK_SECRET
 
 ### Usage and verification
 
-Only the administrator can use the bot in a private chat. `/start` shows recent device data, `/status` refreshes the overview, `/list` lists devices, `/device ID` shows details, and `/settings` opens settings. Overview and list pages hold ten devices. IPs are hidden; devices are sorted by IP by default, and offline devices always stay at the top.
+Only the administrator can use the bot in a private chat. `/start` shows recent device data, `/status` refreshes the overview, `/list` lists devices, `/device ID` shows details, and `/settings` opens settings. The overview lists offline devices only; the device list shows every device. Both hold ten devices per page. IPs are hidden; devices are sorted by IP by default, and offline devices always stay at the top.
 
 “⚙️ Settings” on the overview has “↕️ Sort by” and “🏷 Tag filter” pages. Sort by IP, name, or country (with GeoIP enabled); the tag filter hides or shows devices by tag, and changes sync immediately. Settings cost one D1 write only when changed.
 

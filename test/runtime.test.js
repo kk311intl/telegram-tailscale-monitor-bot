@@ -94,9 +94,11 @@ test('invalid list pages cannot produce broken Telegram callback data', async t 
 });
 
 test('overview and list retain their distinct out-of-range page fallbacks', async t => {
-  const { env, devices } = setup(t);
+  const { db, env, devices } = setup(t);
   devices.push(...Array.from({ length: 20 }, (_, i) => ({ id: 'fallback-' + i, name: 'fallback-' + i, connectedToControl: true })));
   await app.syncTailscaleDevices(env, false);
+  // The overview pages through offline devices only.
+  db.exec("UPDATE servers SET status = 'down'");
   const overview = await app.dashboardView(env, '', 99);
   const list = await app.deviceListView(env, 99);
   assert.match(overview.text, /1\/3/);
@@ -359,13 +361,14 @@ test('message and button refresh render the same dashboard', async t => {
     sent.find(call => call.method === 'editMessageText').body.text);
 });
 
-test('dashboard shows ten devices per page and keeps refresh on the selected page', async t => {
-  const { env, devices, calls } = setup(t);
+test('dashboard shows ten offline devices per page and keeps refresh on the selected page', async t => {
+  const { db, env, devices, calls } = setup(t);
   devices.splice(0, devices.length, ...Array.from({ length: 120 }, (_, index) => ({
     id: `n${index + 1}`, name: `node${String(index + 1).padStart(3, '0')}-${'x'.repeat(24)}.example.ts.net`,
-    connectedToControl: true, tags: []
+    connectedToControl: false, tags: []
   })));
   await app.syncTailscaleDevices(env, false);
+  db.exec("UPDATE servers SET status = 'down'");
   const first = await app.dashboardView(env);
   const second = await app.dashboardView(env, '', 1);
   assert.match(first.text, /node001/);
@@ -959,7 +962,7 @@ test('deployment language controls views and scheduled notification text', async
     const detail = await app.deviceDetailView(env, 1, 0);
     assert.equal(overview.reply_markup.inline_keyboard.flat().find(button => button.callback_data.startsWith('refresh:')).text, detail.reply_markup.inline_keyboard[0][0].text);
     assert.match(overview.text, /^<b>[^\n]+<\/b>\n\n/);
-    assert.match(overview.text, /\n\n<b>[^\n]+<\/b>\n🟢/);
+    assert.match(overview.text, /\n\n<b>[^\n]+<\/b>\n[^\n]+$/);
     assert.doesNotMatch(overview.text, /\n\n\n/);
     await app.sendStatusNotification({ id: 1, name: 'node', device: { lastSeen: '2026-09-01T00:00:00Z' }, event: 'down', eventTime: 1 }, env);
     assert.match(sent.at(-1).text, new RegExp(offline));
@@ -1279,7 +1282,9 @@ function settingsHarness(t) {
   return harness;
 }
 
-const deviceOrder = view => [...view.text.matchAll(/<b>(alpha|beta|gamma)[^<]*<\/b>/g)].map(match => match[1]);
+// Sorting is checked on the device list, which shows every visible device.
+const listOrder = async env => (await app.deviceListView(env, 0)).reply_markup.inline_keyboard.flat()
+  .map(button => button.text.match(/\b(alpha|beta|gamma)\b/)?.[1]).filter(Boolean);
 const keyboard = view => view.reply_markup.inline_keyboard.map(row => row.map(button => [button.text, button.callback_data]));
 
 test('owner sorts devices in a sort submenu while offline devices stay on top', async t => {
@@ -1288,7 +1293,7 @@ test('owner sorts devices in a sort submenu while offline devices stay on top', 
   await app.syncTailscaleDevices(env, false);
   await app.syncTailscaleDevices(env, false);
   assert.equal(db.prepare("SELECT status FROM servers WHERE host='c'").get().status, 'down');
-  assert.deepEqual(deviceOrder(await app.dashboardView(env)), ['gamma', 'beta', 'alpha']);
+  assert.deepEqual(await listOrder(env), ['gamma', 'beta', 'alpha']);
   await press('settings');
   assert.match(view().text, /排序依據：IP 位址/);
   assert.deepEqual(keyboard(view()), [[['↕️ 排序依據', 'sorts']], [['🏷 標籤篩選', 'tags']], [['返回總覽', 'home']]]);
@@ -1303,24 +1308,24 @@ test('owner sorts devices in a sort submenu while offline devices stay on top', 
   // One settings write plus two Telegram calls with two lease writes each.
   assert.equal(db.prepare('SELECT total_changes() AS n').get().n - before, 5);
   assert.deepEqual(keyboard(view())[1], [['✓ 名稱', 'sort:name']]);
-  assert.deepEqual(deviceOrder(await app.dashboardView(env)), ['gamma', 'alpha', 'beta']);
+  assert.deepEqual(await listOrder(env), ['gamma', 'alpha', 'beta']);
   env.GEOIP_ENABLED = 'true';
   db.exec(`UPDATE servers SET last_results = json_set(last_results, '$[0].country', 'JP') WHERE host = 'a'`);
   await press('sorts');
   assert.deepEqual(keyboard(view()).map(row => row[0][1]), ['sort:ip', 'sort:name', 'sort:country', 'settings']);
   await press('sort:country');
   // Devices without a country follow those with one.
-  assert.deepEqual(deviceOrder(await app.dashboardView(env)), ['gamma', 'alpha', 'beta']);
+  assert.deepEqual(await listOrder(env), ['gamma', 'alpha', 'beta']);
   db.exec(`UPDATE servers SET last_results = json_set(last_results, '$[0].country', 'US') WHERE host = 'b'`);
-  assert.deepEqual(deviceOrder(await app.dashboardView(env)), ['gamma', 'alpha', 'beta']);
+  assert.deepEqual(await listOrder(env), ['gamma', 'alpha', 'beta']);
   db.exec(`UPDATE servers SET last_results = json_set(last_results, '$[0].country', 'AU') WHERE host = 'b'`);
-  assert.deepEqual(deviceOrder(await app.dashboardView(env)), ['gamma', 'beta', 'alpha']);
+  assert.deepEqual(await listOrder(env), ['gamma', 'beta', 'alpha']);
   const unchanged = db.prepare('SELECT total_changes() AS n').get().n;
   await press('sort:country');
   assert.equal(db.prepare('SELECT total_changes() AS n').get().n - unchanged, 4);
   // A saved country order falls back to IP while GeoIP is disabled.
   env.GEOIP_ENABLED = 'false';
-  assert.deepEqual(deviceOrder(await app.dashboardView(env)), ['gamma', 'beta', 'alpha']);
+  assert.deepEqual(await listOrder(env), ['gamma', 'beta', 'alpha']);
   await press('settings');
   assert.match(view().text, /排序依據：IP 位址/);
 });
@@ -1329,7 +1334,7 @@ test('owner toggles hidden tags in a tag submenu and the filter applies immediat
   const { db, env, calls, press, view } = settingsHarness(t);
   env.HIDDEN_TAGS = 'tag:personal';
   await app.syncTailscaleDevices(env, false);
-  assert.deepEqual(deviceOrder(await app.dashboardView(env)), ['beta', 'gamma']);
+  assert.deepEqual(await listOrder(env), ['beta', 'gamma']);
   await press('settings');
   assert.match(view().text, /隱藏標籤：tag:personal$/);
   assert.doesNotMatch(view().text, /預設/);
@@ -1344,16 +1349,16 @@ test('owner toggles hidden tags in a tag submenu and the filter applies immediat
   const syncs = calls.filter(url => url.includes('/devices?')).length;
   await press('hide:tag:server');
   assert.equal(calls.filter(url => url.includes('/devices?')).length, syncs + 1);
-  assert.deepEqual(deviceOrder(await app.dashboardView(env)), ['gamma']);
+  assert.deepEqual(await listOrder(env), ['gamma']);
   assert.match(view().text, /標籤篩選/);
   await press('hide:tag:personal');
-  assert.deepEqual(deviceOrder(await app.dashboardView(env)), ['alpha', 'gamma']);
+  assert.deepEqual(await listOrder(env), ['alpha', 'gamma']);
   assert.deepEqual(JSON.parse(db.prepare("SELECT token FROM runtime_state WHERE key='settings'").get().token),
     { sort: 'ip', hiddenTags: ['tag:server'] });
   // Once saved, the bot setting is authoritative; the deployment value only seeded it.
   env.HIDDEN_TAGS = 'tag:home';
   await app.syncTailscaleDevices(env, false);
-  assert.deepEqual(deviceOrder(await app.dashboardView(env)), ['alpha', 'gamma']);
+  assert.deepEqual(await listOrder(env), ['alpha', 'gamma']);
   // Buttons from older settings messages fall back to the tag submenu without writing.
   const before = db.prepare('SELECT total_changes() AS n').get().n;
   await press('tags:reset');
@@ -1366,11 +1371,25 @@ test('settings ignore malformed saved values and overlong tag callbacks', async 
   env.HIDDEN_TAGS = 'tag:personal';
   db.exec("INSERT INTO runtime_state(key, token) VALUES ('settings', 'not json')");
   await app.syncTailscaleDevices(env, false);
-  assert.deepEqual(deviceOrder(await app.dashboardView(env)), ['beta', 'gamma']);
+  assert.deepEqual(await listOrder(env), ['beta', 'gamma']);
   await press(`hide:${'x'.repeat(200)}`);
   assert.equal(db.prepare("SELECT token FROM runtime_state WHERE key='settings'").get().token, 'not json');
   assert.equal(sent.length, 1);
   await app.processUpdate({ message: { from: { id: 1 }, chat: { id: 1, type: 'private' }, text: '/settings' } }, env);
   assert.match(sent.at(-1).body.text, /顯示設定/);
   assert.equal(sent.at(-1).method, 'sendMessage');
+});
+
+test('overview lists offline devices only while the device list keeps every device', async t => {
+  const { db, env } = settingsHarness(t);
+  await app.syncTailscaleDevices(env, false);
+  const allOnline = await app.dashboardView(env);
+  assert.match(allOnline.text, /<b>離線設備<\/b>\n目前沒有離線設備。$/);
+  assert.doesNotMatch(allOnline.text, /alpha|beta|gamma/);
+  db.exec("UPDATE servers SET status = 'down' WHERE name = 'beta'");
+  const overview = await app.dashboardView(env);
+  assert.match(overview.text, /🔴 離線：1/);
+  assert.match(overview.text, /📋 總計：3/);
+  assert.match(overview.text, /<b>離線設備<\/b>\n🔴 <b>beta<\/b>$/);
+  assert.deepEqual(await listOrder(env), ['beta', 'alpha', 'gamma']);
 });
