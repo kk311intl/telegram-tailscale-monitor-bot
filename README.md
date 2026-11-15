@@ -2,7 +2,7 @@
 
 [中文](#zh-tw) · [日本語](#ja) · [English](#en)
 
-`v1.5.1` · [GPL-3.0-only](LICENSE)
+`v1.5.0` · [GPL-3.0-only](LICENSE)
 
 <a id="zh-tw"></a>
 
