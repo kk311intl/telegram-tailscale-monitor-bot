@@ -23,8 +23,7 @@ const GEOIP_API = "https://api.country.is";
 const GEOIP_CACHE_SECONDS = 7 * 86400;
 const GEOIP_RETRY_SECONDS = 6 * 3600;
 const GEOIP_LOOKUPS_PER_SYNC = 5;
-const SORT_MODES = ["ip", "name", "status"];
-const STATUS_ORDER = { down: 0, unknown: 1, up: 2 };
+const SORT_MODES = ["ip", "name", "country"];
 const MAX_SETTING_TAGS = 20;
 const MAX_HIDDEN_TAGS = 50;
 // Every guarded write binds the current sync lease token to this clause.
@@ -180,25 +179,23 @@ async function processCallback(query, env, work) {
   if (action === "list") return editDeviceList(chatId, messageId, env, Number(rawId || 0));
   if (action === "detail") return editDeviceDetail(chatId, messageId, env, Number(rawId), Number(rawPage || 0));
   if (action === "settings") return editOrSend(chatId, messageId, await settingsView(env), env);
+  if (action === "sorts") return editOrSend(chatId, messageId, await sortView(env), env);
   if (action === "sort") {
     const settings = await readSettings(env);
-    if (SORT_MODES.includes(rawId) && rawId !== settings.sort) await saveSettings(env, { ...settings, sort: rawId });
-    return editOrSend(chatId, messageId, await settingsView(env), env);
+    if (sortModes(env).includes(rawId) && rawId !== settings.sort) await saveSettings(env, { ...settings, sort: rawId });
+    return editOrSend(chatId, messageId, await sortView(env), env);
   }
-  if (action === "hide" || (action === "tags" && rawId === "reset")) {
+  if (action === "tags") return editOrSend(chatId, messageId, await tagFilterView(env), env);
+  if (action === "hide") {
+    const tag = data.slice(5).trim().toLowerCase();
+    if (!tag || tag.length > 128) return;
     const settings = await readSettings(env);
-    if (action === "hide") {
-      const tag = data.slice(5).trim().toLowerCase();
-      const hidden = new Set(settings.hiddenTags);
-      if (!tag || tag.length > 128) return;
-      if (hidden.has(tag)) hidden.delete(tag);
-      else if (hidden.size < MAX_HIDDEN_TAGS) hidden.add(tag);
-      await saveSettings(env, { ...settings, hiddenTags: [...hidden].sort(), custom: true });
-    } else if (settings.custom) {
-      await saveSettings(env, { ...settings, custom: false });
-    }
+    const hidden = new Set(settings.hiddenTags);
+    if (hidden.has(tag)) hidden.delete(tag);
+    else if (hidden.size < MAX_HIDDEN_TAGS) hidden.add(tag);
+    await saveSettings(env, { ...settings, hiddenTags: [...hidden].sort() });
     // Apply the new filter right away; a failed sync keeps the saved setting for the next minute.
-    return editOrSend(chatId, messageId, await settingsView(env, await syncWarning(env, work)), env);
+    return editOrSend(chatId, messageId, await tagFilterView(env, await syncWarning(env, work)), env);
   }
   if (action === "check") {
     const id = Number(rawId);
@@ -606,12 +603,17 @@ function deviceLabel(name, device, env) {
   return `${name}${flag ? ` ${flag}` : ""}`;
 }
 
+// Offline devices always come first; the chosen key orders the rest.
 function sortDeviceRows(rows, sort) {
-  const keyed = rows.map(row => ({ row, address: parseDevice(row.last_results).addresses?.[0] }));
+  const keyed = rows.map(row => {
+    const device = parseDevice(row.last_results);
+    return { row, address: device.addresses?.[0], country: /^[A-Z]{2}$/.test(String(device.country || "")) ? device.country : "" };
+  });
+  const byOffline = (a, b) => Number(b.row.status === "down") - Number(a.row.status === "down");
   const byAddress = (a, b) => compareTailscaleAddresses(a.address, b.address);
   const byName = (a, b) => String(a.row.name).localeCompare(String(b.row.name), "zh-Hant");
-  const byStatus = (a, b) => (STATUS_ORDER[a.row.status] ?? 1) - (STATUS_ORDER[b.row.status] ?? 1);
-  const order = sort === "name" ? [byName, byAddress] : sort === "status" ? [byStatus, byAddress, byName] : [byAddress, byName];
+  const byCountry = (a, b) => Number(!a.country) - Number(!b.country) || a.country.localeCompare(b.country);
+  const order = [byOffline, ...(sort === "name" ? [byName, byAddress] : sort === "country" ? [byCountry, byAddress, byName] : [byAddress, byName])];
   return keyed.sort((a, b) => {
     for (const compare of order) {
       const result = compare(a, b);
@@ -630,18 +632,23 @@ async function visibleDeviceRows(env) {
 }
 
 // Settings live in one runtime_state row and are written only when the owner changes them.
+// HIDDEN_TAGS only seeds the hidden tags until the first saved change.
 async function readSettings(env) {
   let saved;
   try { saved = JSON.parse((await readState(env.STATUS_DB, 'settings')).token || "{}"); } catch { saved = {}; }
   if (!saved || typeof saved !== "object") saved = {};
-  const custom = Array.isArray(saved.hiddenTags);
-  const tags = (custom ? saved.hiddenTags : String(env.HIDDEN_TAGS || "").split(","))
+  const tags = (Array.isArray(saved.hiddenTags) ? saved.hiddenTags : String(env.HIDDEN_TAGS || "").split(","))
     .map(tag => String(tag).trim().toLowerCase()).filter(Boolean);
-  return { sort: SORT_MODES.includes(saved.sort) ? saved.sort : "ip", hiddenTags: [...new Set(tags)], custom };
+  return { sort: sortModes(env).includes(saved.sort) ? saved.sort : "ip", hiddenTags: [...new Set(tags)] };
+}
+
+// Country sorting needs GeoIP flags, so it is offered only when GeoIP is enabled.
+function sortModes(env) {
+  return env.GEOIP_ENABLED === "true" ? SORT_MODES : SORT_MODES.filter(mode => mode !== "country");
 }
 
 async function saveSettings(env, settings) {
-  const value = { sort: settings.sort, ...(settings.custom ? { hiddenTags: settings.hiddenTags } : {}) };
+  const value = { sort: settings.sort, hiddenTags: settings.hiddenTags };
   await env.STATUS_DB.prepare(`INSERT INTO runtime_state(key, token) VALUES ('settings', ?)
     ON CONFLICT(key) DO UPDATE SET token = excluded.token`).bind(JSON.stringify(value)).run();
 }
@@ -651,7 +658,43 @@ function tagCallback(tag) {
   return new TextEncoder().encode(data).length <= 64 ? data : "";
 }
 
-async function settingsView(env, warning = "") {
+function hiddenTagsText(settings, lang) {
+  return settings.hiddenTags.length ? escapeHtml(truncate(settings.hiddenTags.join(", "), 300)) : t(lang, "none");
+}
+
+async function settingsView(env) {
+  const lang = env.BOT_LANGUAGE;
+  const settings = await readSettings(env);
+  return {
+    text: [
+      `<b>⚙️ ${t(lang, "settings")}</b>`,
+      "",
+      `${t(lang, "sortBy")}${t(lang, "colon")}${t(lang, `sort_${settings.sort}`)}`,
+      `${t(lang, "hiddenTags")}${t(lang, "colon")}${hiddenTagsText(settings, lang)}`
+    ].join("\n"),
+    parse_mode: "HTML",
+    reply_markup: { inline_keyboard: [
+      [{ text: `↕️ ${t(lang, "sortBy")}`, callback_data: "sorts" }],
+      [{ text: `🏷 ${t(lang, "tagFilter")}`, callback_data: "tags" }],
+      [{ text: t(lang, "backOverview"), callback_data: "home" }]
+    ] }
+  };
+}
+
+async function sortView(env) {
+  const lang = env.BOT_LANGUAGE;
+  const settings = await readSettings(env);
+  return {
+    text: [`<b>↕️ ${t(lang, "sortBy")}</b>`, "", t(lang, "sortHelp")].join("\n"),
+    parse_mode: "HTML",
+    reply_markup: { inline_keyboard: [
+      ...sortModes(env).map(mode => [{ text: `${mode === settings.sort ? "✓ " : ""}${t(lang, `sort_${mode}`)}`, callback_data: `sort:${mode}` }]),
+      [{ text: t(lang, "backSettings"), callback_data: "settings" }]
+    ] }
+  };
+}
+
+async function tagFilterView(env, warning = "") {
   const lang = env.BOT_LANGUAGE;
   const [settings, query] = await Promise.all([
     readSettings(env),
@@ -663,28 +706,17 @@ async function settingsView(env, warning = "") {
     for (const tag of parseDevice(row.last_results).tags || []) known.add(String(tag).toLowerCase());
   }
   const tagButtons = [...known].sort().filter(tagCallback).slice(0, MAX_SETTING_TAGS).map(tag => ({
-    text: `${hidden.has(tag) ? "🙈" : "👁"} ${truncate(tag, 28)}`, callback_data: tagCallback(tag)
+    text: `${hidden.has(tag) ? "✕" : "✓"} ${truncate(tag, 28)}`, callback_data: tagCallback(tag)
   }));
-  const tagRows = [];
-  for (let index = 0; index < tagButtons.length; index += 2) tagRows.push(tagButtons.slice(index, index + 2));
-  const hiddenText = hidden.size ? escapeHtml(truncate([...hidden].join(", "), 300)) : t(lang, "none");
   return {
     text: [
-      `<b>⚙️ ${t(lang, "settings")}</b>`,
+      `<b>🏷 ${t(lang, "tagFilter")}</b>`,
       "",
-      `${t(lang, "sortBy")}${t(lang, "colon")}${t(lang, `sort_${settings.sort}`)}`,
-      `${t(lang, "hiddenTags")}${t(lang, "colon")}${hiddenText}${settings.custom ? "" : ` (${t(lang, "deploymentDefault")})`}`,
-      "",
-      t(lang, "settingsHelp"),
+      tagButtons.length ? t(lang, "tagHelp") : t(lang, "noTags"),
       warning ? `\n⚠️ ${t(lang, "syncFailed")}` : null
     ].filter(line => line !== null).join("\n"),
     parse_mode: "HTML",
-    reply_markup: { inline_keyboard: [
-      SORT_MODES.map(mode => ({ text: `${mode === settings.sort ? "✅ " : ""}${t(lang, `sort_${mode}`)}`, callback_data: `sort:${mode}` })),
-      ...tagRows,
-      ...(settings.custom ? [[{ text: t(lang, "resetTags"), callback_data: "tags:reset" }]] : []),
-      [{ text: t(lang, "backOverview"), callback_data: "home" }]
-    ] }
+    reply_markup: { inline_keyboard: [...tagButtons.map(button => [button]), [{ text: t(lang, "backSettings"), callback_data: "settings" }]] }
   };
 }
 
@@ -697,13 +729,13 @@ function pageNavigation(env, page, pages, action) {
 }
 
 function mainKeyboard(env, page = 0, pages = 1) {
-  const buttons = [[
-    { text: `📋 ${t(env.BOT_LANGUAGE, "deviceList")}`, callback_data: "list:0" },
-    { text: `🔄 ${t(env.BOT_LANGUAGE, "refresh")}`, callback_data: `refresh:${page}` }
-  ]];
-  if (pages > 1) buttons.push(pageNavigation(env, page, pages, 'page'));
-  buttons.push([{ text: `⚙️ ${t(env.BOT_LANGUAGE, "settingsButton")}`, callback_data: "settings" }]);
-  return { inline_keyboard: buttons };
+  // Refresh comes first; page navigation stays on one row; other menu actions get one row each.
+  return { inline_keyboard: [
+    [{ text: `🔄 ${t(env.BOT_LANGUAGE, "refresh")}`, callback_data: `refresh:${page}` }],
+    ...(pages > 1 ? [pageNavigation(env, page, pages, 'page')] : []),
+    [{ text: `📋 ${t(env.BOT_LANGUAGE, "deviceList")}`, callback_data: "list:0" }],
+    [{ text: `⚙️ ${t(env.BOT_LANGUAGE, "settingsButton")}`, callback_data: "settings" }]
+  ] };
 }
 
 async function sendDeviceList(chatId, env, page) {

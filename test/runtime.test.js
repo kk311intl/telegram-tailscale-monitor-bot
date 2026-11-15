@@ -375,7 +375,7 @@ test('dashboard shows ten devices per page and keeps refresh on the selected pag
   assert.match(first.text, /node010/);
   assert.doesNotMatch(second.text, /node021/);
   assert.equal(first.reply_markup.inline_keyboard[1].at(-1).callback_data, 'page:1');
-  assert.equal(second.reply_markup.inline_keyboard[0][1].callback_data, 'refresh:1');
+  assert.deepEqual(second.reply_markup.inline_keyboard.map(row => row.map(button => button.callback_data)), [['refresh:1'], ['page:0', 'noop', 'page:2'], ['list:0'], ['settings']]);
   for (let page = 0; page < 12; page++) assert.ok((await app.dashboardView(env, '', page)).text.length < 4096);
 
   const sent = [];
@@ -957,7 +957,7 @@ test('deployment language controls views and scheduled notification text', async
     assert.match((await app.deviceDetailView(env, 1, 0)).text, new RegExp(lastSeen));
     const overview = await app.dashboardView(env);
     const detail = await app.deviceDetailView(env, 1, 0);
-    assert.equal(overview.reply_markup.inline_keyboard[0][1].text, detail.reply_markup.inline_keyboard[0][0].text);
+    assert.equal(overview.reply_markup.inline_keyboard.flat().find(button => button.callback_data.startsWith('refresh:')).text, detail.reply_markup.inline_keyboard[0][0].text);
     assert.match(overview.text, /^<b>[^\n]+<\/b>\n\n/);
     assert.match(overview.text, /\n\n<b>[^\n]+<\/b>\n🟢/);
     assert.doesNotMatch(overview.text, /\n\n\n/);
@@ -1279,54 +1279,86 @@ function settingsHarness(t) {
   return harness;
 }
 
-const deviceOrder = view => [...view.text.matchAll(/<b>(alpha|beta|gamma)<\/b>/g)].map(match => match[1]);
+const deviceOrder = view => [...view.text.matchAll(/<b>(alpha|beta|gamma)[^<]*<\/b>/g)].map(match => match[1]);
+const keyboard = view => view.reply_markup.inline_keyboard.map(row => row.map(button => [button.text, button.callback_data]));
 
-test('owner can change device sorting from the settings menu with a single write', async t => {
+test('owner sorts devices in a sort submenu while offline devices stay on top', async t => {
   const { db, env, press, view } = settingsHarness(t);
   db.exec("INSERT INTO servers(name,host,ports,status,consecutive_failures,last_results,created_at,updated_at) VALUES('gamma','c','tailscale','up',1,'[]',1,1)");
   await app.syncTailscaleDevices(env, false);
   await app.syncTailscaleDevices(env, false);
-  assert.deepEqual(deviceOrder(await app.dashboardView(env)), ['beta', 'alpha', 'gamma']);
+  assert.equal(db.prepare("SELECT status FROM servers WHERE host='c'").get().status, 'down');
+  assert.deepEqual(deviceOrder(await app.dashboardView(env)), ['gamma', 'beta', 'alpha']);
   await press('settings');
-  assert.match(view().text, /IP 位址/);
-  assert.ok(view().reply_markup.inline_keyboard[0].some(button => button.text === '✅ IP 位址'));
+  assert.match(view().text, /排序依據：IP 位址/);
+  assert.deepEqual(keyboard(view()), [[['↕️ 排序依據', 'sorts']], [['🏷 標籤篩選', 'tags']], [['返回總覽', 'home']]]);
+  await press('sorts');
+  assert.match(view().text, /離線設備始終置頂/);
+  // Country sorting is offered only when GeoIP flags exist.
+  assert.deepEqual(keyboard(view()), [[['✓ IP 位址', 'sort:ip']], [['名稱', 'sort:name']], [['返回設定', 'settings']]]);
+  await press('sort:country');
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM runtime_state WHERE key='settings'").get().n, 0);
   const before = db.prepare('SELECT total_changes() AS n').get().n;
   await press('sort:name');
   // One settings write plus two Telegram calls with two lease writes each.
   assert.equal(db.prepare('SELECT total_changes() AS n').get().n - before, 5);
-  assert.match(view().text, /排序依據：名稱/);
-  assert.deepEqual(deviceOrder(await app.dashboardView(env)), ['alpha', 'beta', 'gamma']);
-  await press('sort:status');
+  assert.deepEqual(keyboard(view())[1], [['✓ 名稱', 'sort:name']]);
+  assert.deepEqual(deviceOrder(await app.dashboardView(env)), ['gamma', 'alpha', 'beta']);
+  env.GEOIP_ENABLED = 'true';
+  db.exec(`UPDATE servers SET last_results = json_set(last_results, '$[0].country', 'JP') WHERE host = 'a'`);
+  await press('sorts');
+  assert.deepEqual(keyboard(view()).map(row => row[0][1]), ['sort:ip', 'sort:name', 'sort:country', 'settings']);
+  await press('sort:country');
+  // Devices without a country follow those with one.
+  assert.deepEqual(deviceOrder(await app.dashboardView(env)), ['gamma', 'alpha', 'beta']);
+  db.exec(`UPDATE servers SET last_results = json_set(last_results, '$[0].country', 'US') WHERE host = 'b'`);
+  assert.deepEqual(deviceOrder(await app.dashboardView(env)), ['gamma', 'alpha', 'beta']);
+  db.exec(`UPDATE servers SET last_results = json_set(last_results, '$[0].country', 'AU') WHERE host = 'b'`);
   assert.deepEqual(deviceOrder(await app.dashboardView(env)), ['gamma', 'beta', 'alpha']);
-  await press('sort:bogus');
-  assert.match(view().text, /狀態（離線優先）/);
   const unchanged = db.prepare('SELECT total_changes() AS n').get().n;
-  await press('sort:status');
+  await press('sort:country');
   assert.equal(db.prepare('SELECT total_changes() AS n').get().n - unchanged, 4);
+  // A saved country order falls back to IP while GeoIP is disabled.
+  env.GEOIP_ENABLED = 'false';
+  assert.deepEqual(deviceOrder(await app.dashboardView(env)), ['gamma', 'beta', 'alpha']);
+  await press('settings');
+  assert.match(view().text, /排序依據：IP 位址/);
 });
 
-test('owner can hide and restore tags from the settings menu and the filter applies immediately', async t => {
+test('owner toggles hidden tags in a tag submenu and the filter applies immediately', async t => {
   const { db, env, calls, press, view } = settingsHarness(t);
   env.HIDDEN_TAGS = 'tag:personal';
   await app.syncTailscaleDevices(env, false);
   assert.deepEqual(deviceOrder(await app.dashboardView(env)), ['beta', 'gamma']);
   await press('settings');
-  assert.match(view().text, /隱藏標籤：tag:personal \(部署預設\)/);
-  const buttons = view().reply_markup.inline_keyboard.flat().map(button => button.callback_data);
-  assert.ok(buttons.includes('hide:tag:personal') && buttons.includes('hide:tag:server'));
-  assert.ok(!buttons.includes('tags:reset'));
+  assert.match(view().text, /隱藏標籤：tag:personal$/);
+  assert.doesNotMatch(view().text, /預設/);
+  assert.ok(!view().reply_markup.inline_keyboard.flat().some(button => button.callback_data.startsWith('hide:')));
+  await press('tags');
+  assert.match(view().text, /標籤篩選/);
+  assert.deepEqual(keyboard(view()), [
+    [['✕ tag:personal', 'hide:tag:personal']],
+    [['✓ tag:server', 'hide:tag:server']],
+    [['返回設定', 'settings']]
+  ]);
   const syncs = calls.filter(url => url.includes('/devices?')).length;
   await press('hide:tag:server');
   assert.equal(calls.filter(url => url.includes('/devices?')).length, syncs + 1);
   assert.deepEqual(deviceOrder(await app.dashboardView(env)), ['gamma']);
-  assert.match(view().text, /tag:personal, tag:server/);
+  assert.match(view().text, /標籤篩選/);
   await press('hide:tag:personal');
   assert.deepEqual(deviceOrder(await app.dashboardView(env)), ['alpha', 'gamma']);
-  assert.ok(view().reply_markup.inline_keyboard.flat().some(button => button.callback_data === 'tags:reset'));
+  assert.deepEqual(JSON.parse(db.prepare("SELECT token FROM runtime_state WHERE key='settings'").get().token),
+    { sort: 'ip', hiddenTags: ['tag:server'] });
+  // Once saved, the bot setting is authoritative; the deployment value only seeded it.
+  env.HIDDEN_TAGS = 'tag:home';
+  await app.syncTailscaleDevices(env, false);
+  assert.deepEqual(deviceOrder(await app.dashboardView(env)), ['alpha', 'gamma']);
+  // Buttons from older settings messages fall back to the tag submenu without writing.
+  const before = db.prepare('SELECT total_changes() AS n').get().n;
   await press('tags:reset');
-  assert.deepEqual(deviceOrder(await app.dashboardView(env)), ['beta', 'gamma']);
-  assert.match(view().text, /\(部署預設\)/);
-  assert.deepEqual(JSON.parse(db.prepare("SELECT token FROM runtime_state WHERE key='settings'").get().token), { sort: 'ip' });
+  assert.equal(db.prepare('SELECT total_changes() AS n').get().n - before, 4);
+  assert.match(view().text, /標籤篩選/);
 });
 
 test('settings ignore malformed saved values and overlong tag callbacks', async t => {
