@@ -1,3 +1,5 @@
+import { nowSeconds, safeError } from "./api-runtime.js";
+
 // Covers OAuth, device/GeoIP reads and up to five bounded notification requests.
 const UPDATE_LEASE_SECONDS = 180;
 
@@ -38,5 +40,3 @@ export async function releaseUpdate(database, context, error) {
   `).bind(safeError(error), context.updateId, context.leaseToken).run();
 }
 
-function nowSeconds() { return Math.floor(Date.now() / 1000); }
-function safeError(error) { return String(error?.message || error || "未知錯誤").replace(/[\r\n]+/g, " ").slice(0, 300); }

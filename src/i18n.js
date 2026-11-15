@@ -35,6 +35,17 @@ export const messages = {
     ageHours: (n) => `${n} 小時前`,
     ageDays: (n) => `${n} 天前`,
     syncFailed: "更新失敗，請稍後重試。",
+    settings: "顯示設定",
+    settingsButton: "設定",
+    sortBy: "排序依據",
+    sort_ip: "IP 位址",
+    sort_name: "名稱",
+    sort_status: "狀態（離線優先）",
+    hiddenTags: "隱藏標籤",
+    none: "無",
+    deploymentDefault: "部署預設",
+    settingsHelp: "點排序按鈕切換順序；點標籤切換隱藏（🙈）或顯示（👁）。隱藏的設備不顯示，也不發送通知。",
+    resetTags: "恢復部署預設標籤",
     colon: "："
   },
   ja: {
@@ -73,6 +84,17 @@ export const messages = {
     ageHours: (n) => `${n} 時間前`,
     ageDays: (n) => `${n} 日前`,
     syncFailed: "更新に失敗しました。しばらくしてからお試しください。",
+    settings: "表示設定",
+    settingsButton: "設定",
+    sortBy: "並び順",
+    sort_ip: "IP アドレス",
+    sort_name: "名前",
+    sort_status: "状態（オフライン優先）",
+    hiddenTags: "非表示タグ",
+    none: "なし",
+    deploymentDefault: "デプロイ既定",
+    settingsHelp: "並び順のボタンで順序を切り替えます。タグを押すと非表示（🙈）と表示（👁）を切り替えます。非表示の端末は一覧に出ず、通知もされません。",
+    resetTags: "タグをデプロイ既定に戻す",
     colon: "："
   },
   en: {
@@ -111,6 +133,17 @@ export const messages = {
     ageHours: (n) => `${n} ${n === 1 ? "hour" : "hours"} ago`,
     ageDays: (n) => `${n} ${n === 1 ? "day" : "days"} ago`,
     syncFailed: "Update failed. Try again later.",
+    settings: "Display settings",
+    settingsButton: "Settings",
+    sortBy: "Sort by",
+    sort_ip: "IP address",
+    sort_name: "Name",
+    sort_status: "Status (offline first)",
+    hiddenTags: "Hidden tags",
+    none: "None",
+    deploymentDefault: "deployment default",
+    settingsHelp: "Tap a sort option to change the order. Tap a tag to hide (🙈) or show (👁) its devices. Hidden devices are not listed and send no alerts.",
+    resetTags: "Reset tags to deployment default",
     colon: ": "
   }
 };

@@ -11,7 +11,7 @@ import {
   notificationFailurePlan
 } from "./helpers.js";
 import { claimUpdate, completeUpdate, releaseUpdate } from "./update-lifecycle.js";
-import { acquireLease, releaseLease, readState, checkCooldown, setCooldown, retrySeconds, requestJson, readBoundedText } from "./api-runtime.js";
+import { acquireLease, releaseLease, readState, checkCooldown, setCooldown, retrySeconds, requestJson, readBoundedText, nowSeconds, safeError } from "./api-runtime.js";
 import { t } from "./i18n.js";
 
 const TELEGRAM_API = "https://api.telegram.org";
@@ -23,13 +23,22 @@ const GEOIP_API = "https://api.country.is";
 const GEOIP_CACHE_SECONDS = 7 * 86400;
 const GEOIP_RETRY_SECONDS = 6 * 3600;
 const GEOIP_LOOKUPS_PER_SYNC = 5;
+const SORT_MODES = ["ip", "name", "status"];
+const STATUS_ORDER = { down: 0, unknown: 1, up: 2 };
+const MAX_SETTING_TAGS = 20;
+const MAX_HIDDEN_TAGS = 50;
+// Every guarded write binds the current sync lease token to this clause.
+const SYNC_FENCE = "EXISTS (SELECT 1 FROM runtime_state WHERE key = 'sync' AND token = ? AND until_at > unixepoch())";
 let oauthCache = { clientId: "", token: "", expiresAt: 0 };
 
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
     if (request.method === "GET" && url.pathname === "/health") {
-      return json({ ok: true, service: env.HEALTH_SERVICE || "tailscale-server-monitor", monitor: "tailscale-api" });
+      // Fresh means a Tailscale sync succeeded within the last two minutes, so external monitors can alert on a stalled Cron.
+      const fresh = await visibilityFresh(env).catch(() => false);
+      return json({ ok: fresh, service: env.HEALTH_SERVICE || "tailscale-server-monitor", monitor: "tailscale-api", fresh },
+        { status: fresh ? 200 : 503, headers: { "cache-control": "no-store" } });
     }
     if (request.method !== "POST" || url.pathname !== "/webhook") {
       return new Response("Not found", { status: 404 });
@@ -136,6 +145,7 @@ async function processMessage(message, env, work) {
     chat_id: message.chat.id, ...(await refreshDashboard(env, 0, work))
   });
   if (command === "list") return sendDeviceList(message.chat.id, env, 0);
+  if (command === "settings") return telegram(env, "sendMessage", { chat_id: message.chat.id, ...(await settingsView(env)) });
   const match = text.match(/^\/device(?:@[A-Za-z0-9_]+)?\s+(\d+)$/i);
   if (match) return sendDeviceDetail(message.chat.id, env, Number(match[1]));
   return telegram(env, "sendMessage", {
@@ -160,13 +170,36 @@ async function processCallback(query, env, work) {
   }
   const chatId = query.message.chat.id;
   const messageId = query.message.message_id;
-  const [action, rawId = "", rawPage = ""] = String(query.data || "").split(":");
+  const data = String(query.data || "");
+  const [action, rawId = "", rawPage = ""] = data.split(":");
+  if (action === "noop") return;
   if (action === "home" && rawId === "") return editOrSend(chatId, messageId, await dashboardView(env), env);
   // Keep refresh buttons in older messages working; new navigation uses plain "home".
   if (action === "refresh" || action === "home") return editOrSend(chatId, messageId, await refreshDashboard(env, Number(rawId || 0), work), env);
   if (action === "page") return editOrSend(chatId, messageId, await dashboardView(env, "", Number(rawId || 0)), env);
   if (action === "list") return editDeviceList(chatId, messageId, env, Number(rawId || 0));
   if (action === "detail") return editDeviceDetail(chatId, messageId, env, Number(rawId), Number(rawPage || 0));
+  if (action === "settings") return editOrSend(chatId, messageId, await settingsView(env), env);
+  if (action === "sort") {
+    const settings = await readSettings(env);
+    if (SORT_MODES.includes(rawId) && rawId !== settings.sort) await saveSettings(env, { ...settings, sort: rawId });
+    return editOrSend(chatId, messageId, await settingsView(env), env);
+  }
+  if (action === "hide" || (action === "tags" && rawId === "reset")) {
+    const settings = await readSettings(env);
+    if (action === "hide") {
+      const tag = data.slice(5).trim().toLowerCase();
+      const hidden = new Set(settings.hiddenTags);
+      if (!tag || tag.length > 128) return;
+      if (hidden.has(tag)) hidden.delete(tag);
+      else if (hidden.size < MAX_HIDDEN_TAGS) hidden.add(tag);
+      await saveSettings(env, { ...settings, hiddenTags: [...hidden].sort(), custom: true });
+    } else if (settings.custom) {
+      await saveSettings(env, { ...settings, custom: false });
+    }
+    // Apply the new filter right away; a failed sync keeps the saved setting for the next minute.
+    return editOrSend(chatId, messageId, await settingsView(env, await syncWarning(env, work)), env);
+  }
   if (action === "check") {
     const id = Number(rawId);
     const warning = await syncWarning(env, work);
@@ -182,8 +215,11 @@ export async function runScheduledChecks(event, env) {
     if (["SYNC_BUSY", "API_COOLDOWN"].includes(error.code)) console.info("Tailscale sync skipped", error.code);
     else { syncError = error; console.error("Tailscale sync failed", safeError(error)); }
   }
-  await drainNotificationOutbox(env, 5);
-  if (sync) await refreshDeviceCountries(sync.devices, env);
+  let laterError;
+  try {
+    await drainNotificationOutbox(env, 5);
+    if (sync) await refreshDeviceCountries(sync.devices, env);
+  } catch (error) { laterError = error; }
   const scheduledSeconds = Math.floor(Number(event?.scheduledTime || Date.now()) / 1000);
   if (Math.floor(scheduledSeconds / 60) % 60 === 17) {
     await env.STATUS_DB.batch([
@@ -199,7 +235,7 @@ export async function runScheduledChecks(event, env) {
       `).bind(scheduledSeconds - 90 * 86400)
     ]);
   }
-  if (syncError) throw syncError;
+  if (syncError || laterError) throw syncError || laterError;
   return { sync: sync ? "ok" : "skipped" };
 }
 
@@ -263,7 +299,7 @@ export async function syncTailscaleDevices(env, notify) {
   ).all();
   const existingById = new Map((existingQuery.results || []).map((row) => [String(row.host), row]));
   const previousSeen = parseLastSeenSnapshot((await readState(env.STATUS_DB, 'visibility')).token);
-  const hiddenTags = new Set(String(env.HIDDEN_TAGS || "").split(",").map((tag) => tag.trim().toLowerCase()).filter(Boolean));
+  const hiddenTags = new Set((await readSettings(env)).hiddenTags);
   const visibleDevices = fetchedDevices.filter((device) => !hasHiddenTag(device, hiddenTags));
   const devices = visibleDevices.map(device => env.GEOIP_ENABLED === "true"
     ? cachedDeviceCountry(device, parseDevice(existingById.get(device.id)?.last_results))
@@ -271,7 +307,6 @@ export async function syncTailscaleDevices(env, notify) {
   const visibleIds = new Set(devices.map(device => device.id));
   const statements = [];
   let queued = false;
-  const fence = "EXISTS (SELECT 1 FROM runtime_state WHERE key = 'sync' AND token = ? AND until_at > unixepoch())";
   for (const device of devices) {
     const existing = existingById.get(device.id);
     const saved = persistTailscaleDevice(device, checkedAt, syncToken, env, notify, existing, lease, previousSeen.get(device.id));
@@ -281,17 +316,17 @@ export async function syncTailscaleDevices(env, notify) {
   for (const row of existingQuery.results || []) {
     if (Number(row.enabled) === 1 && !visibleIds.has(String(row.host))) {
       statements.push(env.STATUS_DB.prepare(`UPDATE servers SET enabled = 0, updated_at = ?, revision = revision + 1
-        WHERE id = ? AND revision = ? AND ports = 'tailscale' AND enabled = 1 AND ${fence}`)
+        WHERE id = ? AND revision = ? AND ports = 'tailscale' AND enabled = 1 AND ${SYNC_FENCE}`)
       .bind(checkedAt, row.id, Number(row.revision || 0), lease));
     }
   }
   statements.push(env.STATUS_DB.prepare(`UPDATE notification_outbox SET failed_at = ?, last_error = 'device hidden'
     WHERE sent_at = 0 AND failed_at = 0 AND server_id IN (SELECT id FROM servers WHERE ports = 'tailscale' AND enabled = 0)
-    AND ${fence}`).bind(checkedAt, lease));
+    AND ${SYNC_FENCE}`).bind(checkedAt, lease));
   // A lost fence violates NOT NULL, aborting the whole batch instead of committing a partial snapshot.
   const lastSeenSnapshot = JSON.stringify(devices.map(device => [device.id, device.lastSeen]));
   statements.push(env.STATUS_DB.prepare(`INSERT INTO runtime_state(key, token, until_at)
-    VALUES ('visibility', ?, CASE WHEN ${fence} THEN ? ELSE NULL END)
+    VALUES ('visibility', ?, CASE WHEN ${SYNC_FENCE} THEN ? ELSE NULL END)
     ON CONFLICT(key) DO UPDATE SET token = excluded.token, until_at = excluded.until_at`)
     .bind(lastSeenSnapshot, lease, checkedAt + 120));
   let results;
@@ -333,7 +368,7 @@ async function refreshDeviceCountries(devices, env) {
         AND json_extract(last_results, '$[0].publicIp') = ?
         AND COALESCE(json_extract(last_results, '$[0].countryCheckedAt'), 0) = ?
         AND COALESCE(json_extract(last_results, '$[0].countryRetryAt'), 0) = ?
-        AND EXISTS (SELECT 1 FROM runtime_state WHERE key = 'sync' AND token = ? AND until_at > unixepoch())
+        AND ${SYNC_FENCE}
     `).bind(device.country, device.countryCheckedAt, device.countryRetryAt, checkedAt, device.id,
       device.publicIp, candidates[index].countryCheckedAt, candidates[index].countryRetryAt, lease)));
   } finally { await releaseLease(env.STATUS_DB, 'sync', lease); }
@@ -390,7 +425,7 @@ function persistTailscaleDevice(device, checkedAt, syncToken, env, notify, exist
         last_checked_at, last_changed_at, last_results, last_error,
         revision, last_check_token, created_at, updated_at
       ) SELECT ?, ?, 'tailscale', 1, ?, ?, ?, ?, 0, ?, '', 0, ?, ?, ?
-      WHERE EXISTS (SELECT 1 FROM runtime_state WHERE key = 'sync' AND token = ? AND until_at > unixepoch())
+      WHERE ${SYNC_FENCE}
     `).bind(
       device.displayName, device.id, observation.status, observation.failures, observation.successes,
       checkedAt, metadata, syncToken, checkedAt, checkedAt, lease
@@ -402,7 +437,7 @@ function persistTailscaleDevice(device, checkedAt, syncToken, env, notify, exist
       consecutive_successes = ?, last_checked_at = ?, last_changed_at = ?, last_results = ?,
       last_error = '', revision = revision + 1, last_check_token = ?, updated_at = ?
     WHERE id = ? AND revision = ? AND host = ? AND ports = 'tailscale'
-      AND EXISTS (SELECT 1 FROM runtime_state WHERE key = 'sync' AND token = ? AND until_at > unixepoch())
+      AND ${SYNC_FENCE}
   `).bind(
     device.displayName, observation.status, observation.failures, observation.successes,
     checkedAt, changedAt, metadata, syncToken, checkedAt,
@@ -465,7 +500,7 @@ async function deliverNotification(notification, env) {
     UPDATE notification_outbox SET lease_token = ?, lease_until = ?
     WHERE id = ? AND sent_at = 0 AND failed_at = 0 AND next_attempt_at <= ? AND lease_until <= ?
       AND server_id IN (SELECT id FROM servers WHERE ports = 'tailscale' AND enabled = 1)
-      AND EXISTS (SELECT 1 FROM runtime_state WHERE key = 'sync' AND token = ? AND until_at > unixepoch())
+      AND ${SYNC_FENCE}
   `).bind(leaseToken, nowSeconds() + 60, notification.id, nowSeconds(), nowSeconds(), syncLease).run();
   if (Number(claimed.meta?.changes || 0) !== 1) return false;
   try {
@@ -571,23 +606,92 @@ function deviceLabel(name, device, env) {
   return `${name}${flag ? ` ${flag}` : ""}`;
 }
 
-function compareDeviceRows(left, right) {
-  const byAddress = compareTailscaleAddresses(
-    parseDevice(left.last_results).addresses?.[0],
-    parseDevice(right.last_results).addresses?.[0]
-  );
-  return byAddress || String(left.name).localeCompare(String(right.name), "zh-Hant");
+function sortDeviceRows(rows, sort) {
+  const keyed = rows.map(row => ({ row, address: parseDevice(row.last_results).addresses?.[0] }));
+  const byAddress = (a, b) => compareTailscaleAddresses(a.address, b.address);
+  const byName = (a, b) => String(a.row.name).localeCompare(String(b.row.name), "zh-Hant");
+  const byStatus = (a, b) => (STATUS_ORDER[a.row.status] ?? 1) - (STATUS_ORDER[b.row.status] ?? 1);
+  const order = sort === "name" ? [byName, byAddress] : sort === "status" ? [byStatus, byAddress, byName] : [byAddress, byName];
+  return keyed.sort((a, b) => {
+    for (const compare of order) {
+      const result = compare(a, b);
+      if (result) return result;
+    }
+    return 0;
+  }).map(item => item.row);
 }
 
 async function visibleDeviceRows(env) {
-  const query = await env.STATUS_DB.prepare("SELECT * FROM servers WHERE ports = 'tailscale' AND enabled = 1").all();
-  return (query.results || []).sort(compareDeviceRows);
+  const [query, settings] = await Promise.all([
+    env.STATUS_DB.prepare("SELECT * FROM servers WHERE ports = 'tailscale' AND enabled = 1").all(),
+    readSettings(env)
+  ]);
+  return sortDeviceRows(query.results || [], settings.sort);
+}
+
+// Settings live in one runtime_state row and are written only when the owner changes them.
+async function readSettings(env) {
+  let saved;
+  try { saved = JSON.parse((await readState(env.STATUS_DB, 'settings')).token || "{}"); } catch { saved = {}; }
+  if (!saved || typeof saved !== "object") saved = {};
+  const custom = Array.isArray(saved.hiddenTags);
+  const tags = (custom ? saved.hiddenTags : String(env.HIDDEN_TAGS || "").split(","))
+    .map(tag => String(tag).trim().toLowerCase()).filter(Boolean);
+  return { sort: SORT_MODES.includes(saved.sort) ? saved.sort : "ip", hiddenTags: [...new Set(tags)], custom };
+}
+
+async function saveSettings(env, settings) {
+  const value = { sort: settings.sort, ...(settings.custom ? { hiddenTags: settings.hiddenTags } : {}) };
+  await env.STATUS_DB.prepare(`INSERT INTO runtime_state(key, token) VALUES ('settings', ?)
+    ON CONFLICT(key) DO UPDATE SET token = excluded.token`).bind(JSON.stringify(value)).run();
+}
+
+function tagCallback(tag) {
+  const data = `hide:${tag}`;
+  return new TextEncoder().encode(data).length <= 64 ? data : "";
+}
+
+async function settingsView(env, warning = "") {
+  const lang = env.BOT_LANGUAGE;
+  const [settings, query] = await Promise.all([
+    readSettings(env),
+    env.STATUS_DB.prepare("SELECT last_results FROM servers WHERE ports = 'tailscale' AND enabled = 1").all()
+  ]);
+  const hidden = new Set(settings.hiddenTags);
+  const known = new Set(hidden);
+  for (const row of query.results || []) {
+    for (const tag of parseDevice(row.last_results).tags || []) known.add(String(tag).toLowerCase());
+  }
+  const tagButtons = [...known].sort().filter(tagCallback).slice(0, MAX_SETTING_TAGS).map(tag => ({
+    text: `${hidden.has(tag) ? "🙈" : "👁"} ${truncate(tag, 28)}`, callback_data: tagCallback(tag)
+  }));
+  const tagRows = [];
+  for (let index = 0; index < tagButtons.length; index += 2) tagRows.push(tagButtons.slice(index, index + 2));
+  const hiddenText = hidden.size ? escapeHtml(truncate([...hidden].join(", "), 300)) : t(lang, "none");
+  return {
+    text: [
+      `<b>⚙️ ${t(lang, "settings")}</b>`,
+      "",
+      `${t(lang, "sortBy")}${t(lang, "colon")}${t(lang, `sort_${settings.sort}`)}`,
+      `${t(lang, "hiddenTags")}${t(lang, "colon")}${hiddenText}${settings.custom ? "" : ` (${t(lang, "deploymentDefault")})`}`,
+      "",
+      t(lang, "settingsHelp"),
+      warning ? `\n⚠️ ${t(lang, "syncFailed")}` : null
+    ].filter(line => line !== null).join("\n"),
+    parse_mode: "HTML",
+    reply_markup: { inline_keyboard: [
+      SORT_MODES.map(mode => ({ text: `${mode === settings.sort ? "✅ " : ""}${t(lang, `sort_${mode}`)}`, callback_data: `sort:${mode}` })),
+      ...tagRows,
+      ...(settings.custom ? [[{ text: t(lang, "resetTags"), callback_data: "tags:reset" }]] : []),
+      [{ text: t(lang, "backOverview"), callback_data: "home" }]
+    ] }
+  };
 }
 
 function pageNavigation(env, page, pages, action) {
   const buttons = [];
   if (page > 0) buttons.push({ text: t(env.BOT_LANGUAGE, "previous"), callback_data: `${action}:${page - 1}` });
-  buttons.push({ text: `${page + 1}/${pages}`, callback_data: `${action}:${page}` });
+  buttons.push({ text: `${page + 1}/${pages}`, callback_data: "noop" });
   if (page + 1 < pages) buttons.push({ text: t(env.BOT_LANGUAGE, "next"), callback_data: `${action}:${page + 1}` });
   return buttons;
 }
@@ -598,6 +702,7 @@ function mainKeyboard(env, page = 0, pages = 1) {
     { text: `🔄 ${t(env.BOT_LANGUAGE, "refresh")}`, callback_data: `refresh:${page}` }
   ]];
   if (pages > 1) buttons.push(pageNavigation(env, page, pages, 'page'));
+  buttons.push([{ text: `⚙️ ${t(env.BOT_LANGUAGE, "settingsButton")}`, callback_data: "settings" }]);
   return { inline_keyboard: buttons };
 }
 
@@ -639,9 +744,8 @@ async function editDeviceDetail(chatId, messageId, env, id, page = 0, warning = 
 
 async function deviceDetailView(env, id, page, warning = "") {
   page = clampInteger(page, 0, Number.MAX_SAFE_INTEGER, 0);
-  if (!(await visibilityFresh(env))) return unavailableView(env);
   const row = await getDeviceRow(env, id);
-  if (!row) return { text: t(env.BOT_LANGUAGE, "removed"), reply_markup: mainKeyboard(env) };
+  if (!row) return (await visibilityFresh(env)) ? { text: t(env.BOT_LANGUAGE, "removed"), reply_markup: mainKeyboard(env) } : unavailableView(env);
   if (Number(row.visibility_until || 0) <= nowSeconds()) return unavailableView(env);
   const device = parseDevice(row.last_results);
   const latestSeen = parseLastSeenSnapshot(row.visibility_snapshot);
@@ -701,7 +805,8 @@ async function telegram(env, method, payload, visibilityLease = '') {
   if (!lease) throw Object.assign(new Error('Telegram 發送中，請稍後重試'), { telegramErrorCode: 429, retryAfter: 1 });
   try {
     await checkCooldown(env.STATUS_DB, 'telegram');
-    const renewed = await env.STATUS_DB.prepare(`UPDATE runtime_state SET until_at = unixepoch() + 30
+    // A freshly acquired send lease needs no renewal; notifications also re-check their sync and visibility leases.
+    const renewed = !visibilityLease ? { meta: { changes: 1 } } : await env.STATUS_DB.prepare(`UPDATE runtime_state SET until_at = unixepoch() + 30
       WHERE ((key = 'telegram-send' AND token = ?) OR (? != '' AND key = 'sync' AND token = ?))
         AND EXISTS (SELECT 1 FROM runtime_state WHERE key = 'telegram-send' AND token = ? AND until_at > unixepoch())
         AND (? = '' OR (EXISTS (SELECT 1 FROM runtime_state WHERE key = 'sync' AND token = ? AND until_at > unixepoch())
@@ -770,8 +875,6 @@ function parseCommand(text) {
 function statusIcon(status) { return status === "up" ? "🟢" : status === "down" ? "🔴" : "⚪"; }
 function statusLabel(status, lang) { return t(lang, status === "up" ? "online" : status === "down" ? "offline" : "pending"); }
 function truncate(value, length) { const characters = Array.from(String(value || "")); return characters.length > length ? `${characters.slice(0, length - 1).join("")}…` : characters.join(""); }
-function nowSeconds() { return Math.floor(Date.now() / 1000); }
-function safeError(error) { return String(error?.message || error || "未知錯誤").replace(/[\r\n]+/g, " ").slice(0, 300); }
 function json(value, init = {}) {
   return new Response(JSON.stringify(value), { ...init, headers: { "content-type": "application/json; charset=utf-8", ...(init.headers || {}) } });
 }

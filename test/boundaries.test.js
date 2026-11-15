@@ -51,7 +51,7 @@ test("Telegram UI uses a neutral title and preserves custom titles", () => {
 });
 
 test("Telegram UI hides IP addresses while sorting rows by address", () => {
-  assert.match(source, /sort\(compareDeviceRows\)/);
+  assert.match(source, /sortDeviceRows\(query\.results/);
   assert.match(source, /compareTailscaleAddresses/);
   assert.doesNotMatch(source, /ORDER BY status ASC/);
   assert.doesNotMatch(source, /設備 IP：|Tailscale IP：|無 IP/);

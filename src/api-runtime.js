@@ -1,4 +1,5 @@
 export const nowSeconds = () => Math.floor(Date.now() / 1000);
+export const safeError = (error) => String(error?.message || error || "未知錯誤").replace(/[\r\n]+/g, " ").slice(0, 300);
 const MAX_JSON_RESPONSE_BYTES = 10 * 1024 * 1024;
 
 export async function readBoundedText(stream, maximum, signal) {

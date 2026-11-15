@@ -2,7 +2,7 @@
 
 [中文](#zh-tw) · [日本語](#ja) · [English](#en)
 
-`v1.4.4` · [GPL-3.0-only](LICENSE)
+`v1.5.0` · [GPL-3.0-only](LICENSE)
 
 <a id="zh-tw"></a>
 
@@ -54,7 +54,7 @@ pnpm exec wrangler d1 create tailscale-server-monitor
 | `TIME_ZONE` | `UTC` | 通知與詳情使用的 IANA 時區 |
 | `BOT_TITLE` | 空 | 自訂總覽標題；留空使用所選語言的標題 |
 | `OFFLINE_AFTER` | `2` | 確認離線所需的連續有效觀察次數，範圍 2–10 |
-| `HIDDEN_TAGS` | 空 | 要隱藏的完整標籤，以逗號分隔，如 `tag:lab,tag:test` |
+| `HIDDEN_TAGS` | 空 | 預設隱藏的完整標籤，以逗號分隔，如 `tag:lab,tag:test`；可在 Bot 設定中改寫 |
 | `GEOIP_ENABLED` | `false` | `true` 才查國旗；資料去向見隱私說明 |
 | `TAILSCALE_TAILNET` | `-` | OAuth 所屬 Tailnet，通常不需另設 |
 
@@ -78,7 +78,9 @@ Webhook 工具會隱藏輸入 Bot Token 與同一個 `WEBHOOK_SECRET`，並註�
 
 ### 使用與驗證
 
-僅管理者可在私聊操作：`/start` 查看最近設備資料、`/status` 更新總覽、`/list` 查看列表、`/device ID` 查看詳情。總覽與列表每頁 10 台；IP 不顯示，但按 IP 排序，離線設備不置頂。
+僅管理者可在私聊操作：`/start` 查看最近設備資料、`/status` 更新總覽、`/list` 查看列表、`/device ID` 查看詳情、`/settings` 開啟設定。總覽與列表每頁 10 台；IP 不顯示，預設按 IP 排序，離線設備不置頂。
+
+總覽的「⚙️ 設定」可切換排序依據（IP、名稱、狀態離線優先），並點選標籤隱藏或顯示設備；變更後立即同步。設定只在修改時寫入一次 D1，「恢復部署預設標籤」會改回 `HIDDEN_TAGS`。
 
 返回總覽、翻頁與查看詳情使用最近快照；按「更新狀態」或使用 `/status` 才主動查詢 API。手動更新先回覆畫面，新通知隨後在背景發送，無新通知時不額外喚起背景工作。
 
@@ -92,7 +94,7 @@ Webhook 工具會隱藏輸入 Bot Token 與同一個 `WEBHOOK_SECRET`，並註�
 Invoke-RestMethod https://YOUR_WORKER.workers.dev/health
 ```
 
-`/health` 只確認 Worker 可回應。還須私聊 `/start`、`/status`，檢查設備資料，並確認詳情的「資料更新」隨排程更新。通知測試只用自己可控制的測試設備，不中斷正式服務。
+`/health` 在最近兩分鐘內有成功同步時回應 200，否則回應 503 與 `fresh: false`，可交給外部監控在排程停止時告警。它不檢查 Telegram，還須私聊 `/start`、`/status`，檢查設備資料，並確認詳情的「資料更新」隨排程更新。通知測試只用自己可控制的測試設備，不中斷正式服務。
 
 <a id="zh-upgrade"></a>
 
@@ -178,7 +180,7 @@ pnpm exec wrangler d1 create tailscale-server-monitor
 | `TIME_ZONE` | `UTC` | 通知と詳細に使う IANA タイムゾーン |
 | `BOT_TITLE` | 空 | 概要タイトル。空なら選択した言語に合わせる |
 | `OFFLINE_AFTER` | `2` | オフライン判定に必要な連続した有効な観測数（2～10） |
-| `HIDDEN_TAGS` | 空 | 非表示にする完全なタグ名をカンマ区切りで指定。例：`tag:lab,tag:test` |
+| `HIDDEN_TAGS` | 空 | 既定で非表示にする完全なタグ名をカンマ区切りで指定。例：`tag:lab,tag:test`。Bot の設定で変更可能 |
 | `GEOIP_ENABLED` | `false` | `true` の場合のみ国旗を検索。送信先はプライバシーの説明を参照 |
 | `TAILSCALE_TAILNET` | `-` | OAuth の対象 Tailnet。通常は追加設定不要 |
 
@@ -202,7 +204,9 @@ Webhook ツールで Bot Token と同じ `WEBHOOK_SECRET` を非表示で入力�
 
 ### 使い方と確認
 
-管理者だけが個人チャットで操作できます。`/start` は最近の端末データ、`/status` は概要を更新、`/list` は一覧、`/device ID` は詳細を表示します。概要と一覧は 1 ページ 10 台です。IP は非表示ですが IP 順に並び、オフライン端末は先頭に移動しません。
+管理者だけが個人チャットで操作できます。`/start` は最近の端末データ、`/status` は概要を更新、`/list` は一覧、`/device ID` は詳細、`/settings` は設定を表示します。概要と一覧は 1 ページ 10 台です。IP は非表示で、既定では IP 順に並び、オフライン端末は先頭に移動しません。
+
+概要の「⚙️ 設定」で並び順（IP、名前、状態のオフライン優先）を切り替え、タグを押して端末の非表示と表示を切り替えられます。変更はすぐ同期されます。設定は変更時だけ D1 に 1 回書き込み、「タグをデプロイ既定に戻す」で `HIDDEN_TAGS` に戻ります。
 
 概要への移動、ページ切り替え、詳細表示には直近のスナップショットを使います。「状態を更新」または `/status` で API を取得します。手動更新では画面を先に返し、新しい通知をバックグラウンドで送ります。新しい通知がなければ追加のバックグラウンド処理は起動しません。
 
@@ -216,7 +220,7 @@ Webhook ツールで Bot Token と同じ `WEBHOOK_SECRET` を非表示で入力�
 Invoke-RestMethod https://YOUR_WORKER.workers.dev/health
 ```
 
-`/health` は Worker の応答だけを確認します。個人チャットで `/start` と `/status` を実行し、端末データと、詳細の「データ更新」が定期的に更新されることも確認してください。通知テストは管理できるテスト端末で行い、本番サービスを中断しないでください。
+`/health` は直近 2 分以内に同期が成功していれば 200、そうでなければ 503 と `fresh: false` を返します。外部監視に登録すると定期実行の停止を検知できます。Telegram は確認しないため、個人チャットで `/start` と `/status` を実行し、端末データと、詳細の「データ更新」が定期的に更新されることも確認してください。通知テストは管理できるテスト端末で行い、本番サービスを中断しないでください。
 
 <a id="ja-upgrade"></a>
 
@@ -301,7 +305,7 @@ Put the new database's `database_id` in `wrangler.jsonc` and replace `ADMIN_USER
 | `TIME_ZONE` | `UTC` | IANA time zone for alerts and device details |
 | `BOT_TITLE` | Empty | Dashboard title; empty uses the selected language |
 | `OFFLINE_AFTER` | `2` | Consecutive valid observations to confirm offline, from 2 to 10 |
-| `HIDDEN_TAGS` | Empty | Exact comma-separated tags to hide, e.g. `tag:lab,tag:test` |
+| `HIDDEN_TAGS` | Empty | Default exact comma-separated tags to hide, e.g. `tag:lab,tag:test`; can be changed in the bot settings |
 | `GEOIP_ENABLED` | `false` | Only `true` enables flags; see privacy for data sharing |
 | `TAILSCALE_TAILNET` | `-` | OAuth client's Tailnet; usually no setting is needed |
 
@@ -325,7 +329,9 @@ The webhook tool securely prompts for the Bot Token and the same `WEBHOOK_SECRET
 
 ### Usage and verification
 
-Only the administrator can use the bot in a private chat. `/start` shows recent device data, `/status` refreshes the overview, `/list` lists devices, and `/device ID` shows details. Overview and list pages hold ten devices. IPs are hidden but determine sorting; offline devices are not moved to the top.
+Only the administrator can use the bot in a private chat. `/start` shows recent device data, `/status` refreshes the overview, `/list` lists devices, `/device ID` shows details, and `/settings` opens settings. Overview and list pages hold ten devices. IPs are hidden; devices are sorted by IP by default, and offline devices are not moved to the top.
+
+“⚙️ Settings” on the overview switches the sort order (IP, name, or status with offline first) and hides or shows devices by tag; changes sync immediately. Settings cost one D1 write only when changed, and “Reset tags to deployment default” returns to `HIDDEN_TAGS`.
 
 Returning to the overview, paging, and viewing details use the latest snapshot. Only the refresh button or `/status` requests fresh API data. Manual refreshes reply with the view first, then send new alerts in the background. No extra background work starts when no new alerts were queued.
 
@@ -339,7 +345,7 @@ Replace the example URL with your Worker URL:
 Invoke-RestMethod https://YOUR_WORKER.workers.dev/health
 ```
 
-`/health` only checks the Worker responds. Also use private `/start` and `/status`, inspect the device data, and confirm that “Data updated” in details stays fresh across scheduled runs. Test alerts only with a device you control; do not interrupt production services.
+`/health` returns 200 when a sync succeeded within the last two minutes, otherwise 503 with `fresh: false`, so an external monitor can alert when scheduled runs stop. It does not check Telegram; also use private `/start` and `/status`, inspect the device data, and confirm that “Data updated” in details stays fresh across scheduled runs. Test alerts only with a device you control; do not interrupt production services.
 
 <a id="en-upgrade"></a>
 
